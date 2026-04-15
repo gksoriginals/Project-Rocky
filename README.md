@@ -2,7 +2,7 @@
 
 ![Rocky Agent TUI Demo](static/demo.png)
 
-Rocky is a terminal-first AI agent with long-term memory, tool use, and a live TUI. This project is a dedicated space for **learning and experimenting with various AI agent concepts**, including cognitive architectures, multi-layered memory systems, and localized reasoning loops.
+This project is created for **learning and experimenting with various AI agent concepts** including persona based AI agents, cognitive architectures, multi-layered memory systems, and localized reasoning loops.
 
 ## What Rocky Does
 
