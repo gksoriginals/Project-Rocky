@@ -1,0 +1,7 @@
+interface:
+  display_name: "Code Refactoring"
+  short_description: "Safe incremental refactors and cleanup"
+  default_prompt: "Use $code-refactoring to plan and execute safe, incremental refactors that preserve behavior, add or update tests, and remove stale compatibility code only when it is no longer needed."
+
+policy:
+  allow_implicit_invocation: true

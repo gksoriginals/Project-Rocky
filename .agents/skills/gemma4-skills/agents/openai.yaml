@@ -1,0 +1,7 @@
+interface:
+  display_name: "Gemma 4 Skills"
+  short_description: "Gemma 4 prompt templates and tokens"
+  default_prompt: "Use $gemma4-skills to format a Gemma 4 prompt with the right turn tokens, multimodal placeholders, thinking mode, and tool-call delimiters."
+
+policy:
+  allow_implicit_invocation: true
