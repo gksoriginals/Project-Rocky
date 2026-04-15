@@ -302,11 +302,14 @@ class ToolFormattingTests(unittest.TestCase):
         state.tool_activity = "calling tool: analyze_material"
 
         presence = build_presence_lines(state, width=60, frame=1)
+        next_presence = build_presence_lines(state, width=60, frame=2)
         telemetry = build_telemetry_line(state, width=60)
 
         joined_presence = "\n".join(presence)
-        self.assertIn("◉", joined_presence)
+        next_joined_presence = "\n".join(next_presence)
+        self.assertIn("◆", joined_presence)
         self.assertIn("✦", joined_presence)
+        self.assertNotEqual(joined_presence, next_joined_presence)
         self.assertIn("Working", telemetry)
         self.assertIn("gemma4:e2b", telemetry)
         self.assertIn("1 tool active / 3 available", telemetry)

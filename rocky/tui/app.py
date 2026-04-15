@@ -238,31 +238,40 @@ def build_dialogue_lines(state: SessionState, width: int, height: int) -> list[s
 
 def build_presence_lines(state: SessionState, width: int, frame: int = 0) -> list[str]:
     status = (state.status or "idle").lower()
-    pulse = frame % 4
-    if status == "thinking":
-        outer = "◇" if pulse in {0, 3} else "⋄"
-        center = "◆" if pulse in {0, 3} else "◉"
-        side = "◇" if pulse in {0, 3} else "✦"
-    elif status == "error":
-        outer = "·"
-        center = "⊗"
-        side = "·"
-    elif state.tool_activity:
-        outer = "◇"
-        center = "◆"
-        side = "✦" if pulse in {1, 3} else "◇"
-    else:
-        outer = "◇"
-        center = "◆" if pulse in {0, 2} else "◉"
-        side = "◇"
-
     rows = [
-        f"{outer}       {outer}",
-        f"{outer}         {center}        {outer}",
-        f"{outer}   {side}",
-        f"{outer}               {outer}",
+        [0, "       ", 1],
+        [2, "         ", 3, "        ", 4],
+        [5, "   ", 6],
+        [7, "               ", 8],
     ]
-    return [_left(row, width) for row in rows]
+    active_slot = frame % 9
+    trail_slot = (active_slot - 1) % 9
+    spark_slot = (active_slot + 1) % 9
+    secondary_slot = (active_slot + 4) % 9
+
+    def glyph(slot: int) -> str:
+        if status == "error":
+            return "⊗"
+        if slot == active_slot:
+            return "◆" if (state.tool_activity or status == "thinking") else "◉"
+        if slot == trail_slot:
+            return "✦" if (state.tool_activity or status == "thinking") else "⋄"
+        if slot == spark_slot and (state.tool_activity or status == "thinking"):
+            return "✧"
+        if slot == secondary_slot and status == "thinking":
+            return "◉"
+        return "◇"
+
+    rendered_rows: list[str] = []
+    for row in rows:
+        parts: list[str] = []
+        for item in row:
+            if isinstance(item, int):
+                parts.append(glyph(item))
+            else:
+                parts.append(item)
+        rendered_rows.append("".join(parts))
+    return [_left(row, width) for row in rendered_rows]
 
 
 def build_telemetry_line(state: SessionState, width: int) -> str:
