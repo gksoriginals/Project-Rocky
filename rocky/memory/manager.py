@@ -84,8 +84,11 @@ class SemanticMemory:
         if not normalized_title:
             return None
 
-        if any(entry.title.strip().lower() == normalized_title.lower() for entry in self.entries):
-            return None
+        # Check for existing entry with the same title (case-insensitive)
+        existing_index = next(
+            (i for i, e in enumerate(self.entries) if e.title.strip().lower() == normalized_title.lower()),
+            None
+        )
 
         normalized_content = content.strip() or normalized_title
         entry = SemanticDocument(
@@ -95,8 +98,14 @@ class SemanticMemory:
             aliases=unique_strings(aliases or []),
             tags=unique_strings(tags or []),
         )
-        self.entries.append(entry)
+
+        if existing_index is not None:
+            self.entries[existing_index] = entry
+        else:
+            self.entries.append(entry)
+
         return entry
+
 
     def index_entries(self, limit: int | None = None) -> list[dict[str, object]]:
         entries = self.entries if limit is None else self.entries[-max(int(limit), 0):]
@@ -527,15 +536,25 @@ class MemoryManager:
         if not index_block.strip():
             return []
 
+        # Include minimal context to help the LLM resolve pronouns/references
+        recent = self.recent_dialogue(limit=3)
+        context_str = "\n".join(f"{d['role']}: {d['content']}" for d in recent)
+        payload = f"Context:\n{context_str}\n\nQuery: {query}" if context_str else query
+
         system_prompt = RECALL_SEMANTIC_SYSTEM_PROMPT.format(index_block=index_block)
-        response = self._generate(system_prompt, query, response_format="json")
+        response = self._generate(system_prompt, payload, response_format="json")
         selected_titles = response.get("selected_titles", [])
         if not isinstance(selected_titles, list):
             return []
         return [str(item) for item in selected_titles if str(item).strip()]
 
     def build_memory_routes(self, query: str) -> dict[str, bool]:
-        response = self._generate(ROUTER_SYSTEM_PROMPT, query, response_format="json")
+        # Also include minimal context for routing
+        recent = self.recent_dialogue(limit=2)
+        context_str = "\n".join(f"{d['role']}: {d['content']}" for d in recent)
+        payload = f"Context:\n{context_str}\n\nQuery: {query}" if context_str else query
+
+        response = self._generate(ROUTER_SYSTEM_PROMPT, payload, response_format="json")
         semantic = bool(response.get("semantic"))
         episodic = bool(response.get("episodic"))
         return {"semantic": semantic, "episodic": episodic}
@@ -552,14 +571,18 @@ class MemoryManager:
                 continue
             aliases = ", ".join(entry.get("aliases") or [])
             tags = ", ".join(entry.get("tags") or [])
+
             line = f"- title: {title}"
             if aliases:
                 line += f" | aliases: {aliases}"
+
             if tags:
                 line += f" | tags: {tags}"
             semantic_lines.append(line)
 
         return "Semantic index:\n" + "\n".join(semantic_lines)
+
+
 
     def _build_semantic_index_entries(self) -> list[dict[str, object]]:
         entries: list[dict[str, object]] = []
@@ -699,8 +722,14 @@ class MemoryManager:
         if not candidate_block.strip():
             return []
 
+        # Include minimal context
+        recent = self.recent_dialogue(limit=3)
+        context_str = "\n".join(f"{d['role']}: {d['content']}" for d in recent)
+        payload = f"Context:\n{context_str}\n\nQuery: {query}" if context_str else query
+
         system_prompt = RECALL_EPISODIC_SYSTEM_PROMPT.format(candidate_block=candidate_block)
-        response = self._generate(system_prompt, query, response_format="json")
+        response = self._generate(system_prompt, payload, response_format="json")
+
         selected_ids = response.get("selected_ids", [])
         if not isinstance(selected_ids, list):
             return []
@@ -835,7 +864,16 @@ class MemoryManager:
                 lines.append(f"{entry.role}: {entry.content}")
         return " | ".join(lines)
 
+    def clear_memory_cache(self):
+        """Clears in-memory cache and reloads from the database."""
+        self.episodic.entries = []
+        self.semantic.entries = []
+        self._load_persisted_entries()
+
     def _load_persisted_entries(self):
+        self.episodic.entries = []
+        self.semantic.entries = []
+
         episodic_rows = self.db.load_episodic_entries()
         for row in episodic_rows:
             self.episodic.entries.append(
@@ -866,6 +904,7 @@ class MemoryManager:
                     tags=self._parse_tags(row.get("tags_json") or "[]"),
                 )
             )
+
 
     def _parse_tags(self, raw: str) -> list[str]:
         try:
