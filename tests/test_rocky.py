@@ -369,6 +369,15 @@ class ToolFormattingTests(unittest.TestCase):
         agent.memory_manager = Mock(
             dialogue=["existing"],
             list_memory_titles=Mock(return_value=["Memory One"]),
+            get_semantic_memory=Mock(
+                return_value=Mock(
+                    title="User",
+                    content="User prefers concise answers.",
+                    importance=7,
+                    aliases=["Profile"],
+                    tags=["persona"],
+                )
+            ),
             delete_memory=Mock(return_value={"deleted": True}),
             delete_all_memory=Mock(return_value={"deleted": True, "count": 1}),
         )
@@ -384,6 +393,9 @@ class ToolFormattingTests(unittest.TestCase):
 
         tui.submit_prompt("/memory list semantic 1")
         self.assertIn("Memory One", tui.session_state.current_trace[-1]["detail"])
+
+        tui.submit_prompt("/memory search User")
+        self.assertIn("User prefers concise answers.", tui.session_state.current_trace[-1]["detail"])
 
         tui.submit_prompt("/quit")
         self.assertTrue(tui._should_exit)
@@ -651,6 +663,29 @@ class MemoryTests(unittest.TestCase):
         self.assertTrue(recalled[0].startswith("User prefers concise answers."))
         self.assertTrue(recalled[1].startswith("User prefers concise answers."))
 
+    def test_memory_manager_forces_semantic_selection_for_named_entities(self):
+        manager = MemoryManager(dialogue_window=2, db_path=self.db_path)
+        self.addCleanup(manager.close)
+        manager.add_semantic_memory(
+            title="Cyril and his connection to Gopi",
+            content="The user revealed his name is Cyril and he is Gopi's friend.",
+            aliases=["User Identity Established"],
+            tags=["identity"],
+        )
+        manager.llm = Mock(
+            generate_raw=Mock(
+                side_effect=[
+                    {"text": json.dumps({"semantic": False, "episodic": True})},
+                    {"text": json.dumps({"selected_titles": []})},
+                ]
+            )
+        )
+
+        report = manager.build_memory_load_report("Who is Cyril?")
+
+        self.assertEqual(report["semantic"], ["Cyril and his connection to Gopi"])
+        self.assertEqual(report["episodic"], [])
+
     def test_import_markdown_file_creates_semantic_document(self):
         manager = MemoryManager(dialogue_window=1, db_path=self.db_path)
         self.addCleanup(manager.close)
@@ -719,6 +754,34 @@ class MemoryTests(unittest.TestCase):
         self.assertIn("Semantic memories (2):", result.stdout)
         self.assertIn("1. Rocky's origin", result.stdout)
         self.assertIn("2. Rocky's materials expertise", result.stdout)
+
+    def test_cli_memory_search_prints_full_entry(self):
+        db = MemoryDB(self.db_path)
+        self.addCleanup(db.close)
+        db.persist_semantic_document(
+            "User",
+            "User prefers concise answers.",
+            7,
+            ["Profile"],
+            ["persona"],
+        )
+
+        script_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "rocky.py")
+        env = os.environ.copy()
+        env["ROCKY_MEMORY_DB"] = self.db_path
+        result = subprocess.run(
+            [sys.executable, script_path, "memory", "search", "User"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        self.assertIn("Title: User", result.stdout)
+        self.assertIn("Content: User prefers concise answers.", result.stdout)
+        self.assertIn("Importance: 7", result.stdout)
+        self.assertIn("Aliases: Profile", result.stdout)
+        self.assertIn("Tags: persona", result.stdout)
 
     def test_memory_db_persists_session_snapshot(self):
         db = MemoryDB(self.db_path)

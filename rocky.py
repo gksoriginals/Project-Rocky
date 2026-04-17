@@ -23,6 +23,14 @@ def _load_semantic_titles(limit: int | None = None) -> list[str]:
     return titles
 
 
+def _load_semantic_memory(title: str) -> dict | None:
+    db = MemoryDB(_memory_db_path())
+    try:
+        return db.load_semantic_document_by_title(title)
+    finally:
+        db.close()
+
+
 def _run_ingest(paths: list[str]) -> int:
     from rocky.agent import RockyAgent
     from rocky.config import MODEL_NAME
@@ -62,6 +70,43 @@ def _run_memory_list(args: list[str]) -> int:
     return 0
 
 
+def _run_memory_search(args: list[str]) -> int:
+    if not args:
+        print("Usage: python rocky.py memory search <title>")
+        return 1
+
+    title = " ".join(args).strip()
+    record = _load_semantic_memory(title)
+    if record is None:
+        print(f"No semantic memory found for: {title}")
+        return 0
+
+    aliases = ", ".join(_normalize_list(record.get("aliases_json"))) or "none"
+    tags = ", ".join(_normalize_list(record.get("tags_json"))) or "none"
+    print(f"Title: {record.get('title', '').strip()}")
+    print(f"Content: {record.get('content', '').strip()}")
+    print(f"Importance: {record.get('importance', '')}")
+    print(f"Aliases: {aliases}")
+    print(f"Tags: {tags}")
+    return 0
+
+
+def _normalize_list(raw: object) -> list[str]:
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    if not isinstance(raw, str) or not raw.strip():
+        return []
+    import json
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item).strip() for item in parsed if str(item).strip()]
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
 
@@ -73,6 +118,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args and args[0] == "memory" and len(args) > 1 and args[1] == "list":
         return _run_memory_list(args[2:])
+
+    if args and args[0] == "memory" and len(args) > 1 and args[1] == "search":
+        return _run_memory_search(args[2:])
 
     from rocky.agent import RockyAgent
     from rocky.config import MODEL_NAME

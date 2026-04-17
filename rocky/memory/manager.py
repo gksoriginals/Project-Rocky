@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -216,6 +217,18 @@ class MemoryManager:
     def semantic_titles(self, limit: int | None = None) -> list[str]:
         entries = self.semantic.entries if limit is None else self.semantic.entries[-max(int(limit), 0):]
         return [entry.title for entry in entries if entry.title.strip()]
+
+    def get_semantic_memory(self, title: str) -> SemanticDocument | None:
+        normalized = title.strip().lower()
+        if not normalized:
+            return None
+
+        for entry in self.semantic.entries:
+            if entry.title.strip().lower() == normalized:
+                return entry
+            if any(alias.strip().lower() == normalized for alias in entry.aliases):
+                return entry
+        return None
 
     def episodic_summaries_text(self, limit: int | None = None) -> list[str]:
         entries = self.episodic.entries if limit is None else self.episodic.entries[-max(int(limit), 0):]
@@ -534,7 +547,7 @@ class MemoryManager:
     def _select_relevant_semantic_titles(self, query: str) -> list[str]:
         index_block = self.build_semantic_index_block()
         if not index_block.strip():
-            return []
+            return self._fallback_semantic_matches(query)
 
         # Include minimal context to help the LLM resolve pronouns/references
         recent = self.recent_dialogue(limit=3)
@@ -545,8 +558,15 @@ class MemoryManager:
         response = self._generate(system_prompt, payload, response_format="json")
         selected_titles = response.get("selected_titles", [])
         if not isinstance(selected_titles, list):
-            return []
-        return [str(item) for item in selected_titles if str(item).strip()]
+            selected_titles = []
+
+        cleaned = [str(item) for item in selected_titles if str(item).strip()]
+        fallback = self._fallback_semantic_matches(query)
+        if fallback:
+            for title in fallback:
+                if title not in cleaned:
+                    cleaned.append(title)
+        return cleaned
 
     def build_memory_routes(self, query: str) -> dict[str, bool]:
         # Also include minimal context for routing
@@ -557,6 +577,7 @@ class MemoryManager:
         response = self._generate(ROUTER_SYSTEM_PROMPT, payload, response_format="json")
         semantic = bool(response.get("semantic"))
         episodic = bool(response.get("episodic"))
+        semantic = semantic or bool(self._fallback_semantic_matches(query))
         return {"semantic": semantic, "episodic": episodic}
 
     def build_semantic_index_block(self) -> str:
@@ -606,6 +627,39 @@ class MemoryManager:
             for entry in self._build_semantic_index_entries()
             if str(entry.get("title") or "").strip()
         }
+
+    def _fallback_semantic_matches(self, query: str) -> list[str]:
+        normalized_query = self._normalize_topic(query)
+        if not normalized_query:
+            return []
+
+        query_tokens = {
+            token
+            for token in re.findall(r"[a-z0-9']+", normalized_query)
+            if len(token) > 3
+        }
+        if not query_tokens:
+            return []
+
+        matches: list[str] = []
+        for entry in self.semantic.entries:
+            candidate_texts = [entry.title, *entry.aliases, *entry.tags]
+            for candidate in candidate_texts:
+                normalized_candidate = self._normalize_topic(candidate)
+                if not normalized_candidate:
+                    continue
+                candidate_tokens = {
+                    token
+                    for token in re.findall(r"[a-z0-9']+", normalized_candidate)
+                    if len(token) > 3
+                }
+                if normalized_candidate in normalized_query or normalized_query in normalized_candidate:
+                    matches.append(entry.title)
+                    break
+                if candidate_tokens & query_tokens:
+                    matches.append(entry.title)
+                    break
+        return unique_strings(matches)
 
     def _select_relevant_episodic_ids(self, query: str) -> list[str]:
         candidate_block, candidate_lookup = self.build_episodic_candidate_block()
@@ -903,7 +957,7 @@ class MemoryManager:
                     aliases=self._parse_tags(row.get("aliases_json") or "[]"),
                     tags=self._parse_tags(row.get("tags_json") or "[]"),
                 )
-            )
+                )
 
 
     def _parse_tags(self, raw: str) -> list[str]:

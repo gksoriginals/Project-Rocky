@@ -401,6 +401,7 @@ class RockyTUI:
                 summary="/help",
                 detail=(
                     "/memory <text> | /memory <title> :: <content> | "
+                    "/memory search <title> | "
                     "/memory list [semantic|episodic] [n] | "
                     "/memory delete [semantic|episodic] [selector] | "
                     "/reset | /compact | /tools | /clear | /quit"
@@ -410,7 +411,7 @@ class RockyTUI:
             return
 
         if command == "memory":
-            if remainder and not remainder.lower().startswith(("list ", "delete ")):
+            if remainder and not remainder.lower().startswith(("list ", "search ", "delete ")):
                 self._add_semantic_memory(remainder)
                 return
             self._run_memory_command(remainder)
@@ -428,12 +429,12 @@ class RockyTUI:
     def _run_memory_command(self, remainder: str) -> None:
         parts = remainder.split()
         if not parts:
-            self.session_state.set_notice("Use /memory list or /memory delete.")
+            self.session_state.set_notice("Use /memory list, /memory search, or /memory delete.")
             self.session_state.clear_current_trace()
             self.session_state.add_trace_entry(
                 phase="command",
                 summary="/memory",
-                detail="use /memory list or /memory delete",
+                detail="use /memory list, /memory search, or /memory delete",
                 turn_index=self.session_state.turn_index,
             )
             return
@@ -459,6 +460,36 @@ class RockyTUI:
             self.session_state.add_trace_entry(
                 phase="command",
                 summary=f"/memory list {kind}",
+                detail=detail,
+                turn_index=self.session_state.turn_index,
+            )
+            return
+
+        if subcommand == "search":
+            title = " ".join(parts[1:]).strip()
+            if not title:
+                detail = "Usage: /memory search <title>"
+                self.session_state.set_notice(detail)
+            else:
+                entry = self.agent.memory_manager.get_semantic_memory(title)
+                if entry is None:
+                    detail = f"No semantic memory found for: {title}"
+                    self.session_state.set_notice(detail)
+                else:
+                    alias_text = ", ".join(entry.aliases) if entry.aliases else "none"
+                    tag_text = ", ".join(entry.tags) if entry.tags else "none"
+                    detail = (
+                        f"Title: {entry.title}\n"
+                        f"Content: {entry.content}\n"
+                        f"Importance: {entry.importance}\n"
+                        f"Aliases: {alias_text}\n"
+                        f"Tags: {tag_text}"
+                    )
+                    self.session_state.set_notice(f"Loaded semantic memory: {entry.title}")
+            self.session_state.clear_current_trace()
+            self.session_state.add_trace_entry(
+                phase="command",
+                summary="/memory search",
                 detail=detail,
                 turn_index=self.session_state.turn_index,
             )
@@ -495,7 +526,7 @@ class RockyTUI:
         self.session_state.add_trace_entry(
             phase="command",
             summary="/memory",
-            detail="use /memory list or /memory delete",
+            detail="use /memory list, /memory search, or /memory delete",
             turn_index=self.session_state.turn_index,
         )
 

@@ -78,6 +78,33 @@ class MemoryDB:
     def load_semantic_documents(self) -> list[dict]:
         return self.load_semantic_entries()
 
+    def load_semantic_document_by_title(self, title: str) -> dict | None:
+        normalized = title.strip().lower()
+        if not normalized:
+            return None
+
+        rows = self._conn.execute(
+            """
+            SELECT title, content, importance, aliases_json, tags_json, created_at
+            FROM semantic_documents
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        for row in rows:
+            if str(row["title"] or "").strip().lower() == normalized:
+                return dict(row)
+
+        for row in rows:
+            try:
+                aliases = json.loads(row["aliases_json"] or "[]")
+            except json.JSONDecodeError:
+                aliases = []
+            if not isinstance(aliases, list):
+                continue
+            if any(str(alias).strip().lower() == normalized for alias in aliases):
+                return dict(row)
+        return None
+
     def persist_episodic_entry(self, summary: str, excerpt: str, importance: int, tags: list[str]):
         self._conn.execute(
             """

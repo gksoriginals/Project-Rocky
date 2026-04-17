@@ -67,6 +67,7 @@ Inside the Rocky TUI, you can use the following slash commands:
 
 - `/memory <text>`: Quick-store a semantic memory.
 - `/memory <title> :: <content>`: Store a semantic memory with a specific title and content.
+- `/memory search <title>`: Show the full stored semantic memory for a title.
 - `/memory list [semantic|episodic] [n]`: List stored memories (defaults to semantic).
 - `/memory delete [semantic|episodic] [selector]`: Delete a specific memory by index or title.
 - `/memory delete all [semantic|episodic|all]`: Bulk delete memories.
@@ -88,6 +89,10 @@ You can also manage Rocky's memory directly from your terminal without entering 
 - **List Semantic Titles**:
   ```bash
   python rocky.py memory list [limit]
+  ```
+- **Search a Semantic Memory by Title**:
+  ```bash
+  python rocky.py memory search "User"
   ```
 
 ## Project Structure

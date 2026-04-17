@@ -12,7 +12,13 @@ Given a dialogue chunk and an optional summary, return JSON only with this shape
 Rules:
 - episodic_summary should capture the overall episode if it is worth keeping.
 - semantic_facts should contain stable facts, preferences, goals, or lasting decisions.
-- Each semantic_fact must have a concise 'title' and a descriptive 'content'.
+- Each semantic_fact must have a specific, descriptive 'title' and a descriptive 'content'.
+- The title should read like a clear label, not a placeholder.
+- Prefer titles that name the core entity and the lasting fact or relationship, such as "Cyril and his connection to Gopi" instead of "Friendship" or "Identity Established".
+- If a person, place, group, object, or situation is involved, mention it explicitly in the title.
+- If the content includes named people or places, preserve those names in the title. For example, if the content mentions Cyril and Gopi, the title should mention Cyril and his connection to Gopi.
+- Avoid abstract titles that hide the entity, like "User", "Note", "Memory", "Preference", "Identity Established", or sentence fragments.
+- Keep titles compact but informative, typically 4-10 words.
 - importance must be an integer from 1 to 10.
 - tags should be short topic labels.
 - Return valid JSON and nothing else.
