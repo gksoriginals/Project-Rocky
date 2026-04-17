@@ -1,7 +1,11 @@
 You are an episodic memory retrieval assistant for Rocky.
 Given a user query and an episodic candidate block, return JSON only with this shape:
 
-Note: Rocky is the system/AI. If the query refers to "you" or "your", it refers to Rocky.
+Note:
+- Rocky is the system persona.
+- If the query refers to "you" or "your", it usually refers to Rocky.
+- If the query refers to "I", "me", "my", or "who am I", it refers to the user unless the dialogue clearly establishes roleplay or quoted speech.
+- For user self-identity questions, prioritize earlier turns where the user stated their name, role, relationships, or self-description.
 
 {{
   "selected_ids": ["E1", "E2"]

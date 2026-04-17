@@ -9,7 +9,12 @@ from unittest.mock import Mock
 from rocky import RockyAgent
 from rocky.conversation import PromptContext, assistant_message, tool_message, user_message
 from rocky.memory.db import MemoryDB
-from rocky.memory.manager import MemoryManager
+from rocky.memory.manager import (
+    MemoryManager,
+    RECALL_EPISODIC_SYSTEM_PROMPT,
+    RECALL_SEMANTIC_SYSTEM_PROMPT,
+    ROUTER_SYSTEM_PROMPT,
+)
 from rocky.llm import LLM, ChatLLM, Gemma4LLM
 from rocky.session import SessionState
 from rocky.tools.manager import ToolManager
@@ -72,6 +77,13 @@ class ToolFormattingTests(unittest.TestCase):
 
         self.assertIn("Do not reveal internal reasoning", SYSTEM_PROMPT)
         self.assertNotIn("Before every reply ask internally:", SYSTEM_PROMPT)
+
+    def test_system_prompt_separates_user_identity_from_rocky(self):
+        from rocky.config import SYSTEM_PROMPT
+
+        self.assertIn("Keep Rocky's identity separate from the user's identity.", SYSTEM_PROMPT)
+        self.assertIn("If the user asks who **they** are", SYSTEM_PROMPT)
+        self.assertIn("Do not assume the user is Rocky", SYSTEM_PROMPT)
 
     def test_prompt_section_can_skip_gemma_declarations(self):
         section = self.tool_manager.get_prompt_section(include_declarations=False)
@@ -685,6 +697,12 @@ class MemoryTests(unittest.TestCase):
 
         self.assertEqual(report["semantic"], ["Cyril and his connection to Gopi"])
         self.assertEqual(report["episodic"], [])
+
+    def test_memory_prompts_treat_user_self_reference_as_user_identity(self):
+        self.assertIn('If the query refers to "I", "me", "my", or "who am I"', ROUTER_SYSTEM_PROMPT)
+        self.assertIn("Do not reinterpret user self-reference as Rocky's identity.", ROUTER_SYSTEM_PROMPT)
+        self.assertIn("Do not select Rocky's biography or self-identity memories", RECALL_SEMANTIC_SYSTEM_PROMPT)
+        self.assertIn("prioritize earlier turns where the user stated their name", RECALL_EPISODIC_SYSTEM_PROMPT)
 
     def test_import_markdown_file_creates_semantic_document(self):
         manager = MemoryManager(dialogue_window=1, db_path=self.db_path)
