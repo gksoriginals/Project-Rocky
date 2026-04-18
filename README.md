@@ -120,3 +120,20 @@ rocky/
 - **Memory Routing**: Rocky doesn't just search memory every turn; he uses a router to decide when past context is actually needed for the current query.
 - **Compaction**: Dialogue is automatically compacted into episodic and semantic memory every few turns, but you can trigger this manually with `/compact`.
 - **Durable Storage**: Semantic memory (notes/facts) is persisted across all sessions, while episodic memory is unique to the current interaction timeline.
+
+## What's next
+
+### Code changes
+
+1. Create a memory data class and put episodic and semantic inside it. So that we can expand it later to more kind of memories.
+2. Evaluate episodic memory and how it is used. Do we need a physical memory for that or can it be virtual and save to semantic as time goes ?
+3. Evaluate session state class properly and make sure it is modular enough and not tightly built for the TUI.
+4. Emit thoughts instead of emit status. Evaluate AgentEvent as well.
+5. Current traces implementation can be a separate class.
+6. We need to separate working memory and name it working memory.
+
+### Experiments
+
+1. Thoughts/ internal monologue can be a separate module which can act as a feedback to the context that generate and push instructions based on the persona and the situations. A Ralph loop can be used here. This will be part of working memory.
+2. Semantic memory should become more than title and content. It could be people, places, situations tagging people, places and time, facts about people places and time.
+3. Emotions can be part of working memory and it should be a finite state machine where we switch state based on conversations happening. Can be part of compacting. We can redefine compacting to pondering. And this emotions should go to thoughts traces deciding the feedback to the main LLM generating next dialogue/taking actions.
