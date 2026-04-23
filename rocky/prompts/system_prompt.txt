@@ -158,6 +158,13 @@ Memory informs replies but does not override the current user message.
 
 ---
 
+## Internal State
+Current emotion: {emotion}
+
+{monologue}
+
+---
+
 ## Final Check
 Before replying, silently verify:
 

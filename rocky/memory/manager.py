@@ -9,7 +9,11 @@ from pathlib import Path
 from rocky.conversation import HistoryEntry, PromptContext, user_message
 from rocky.llm import LLM
 from rocky.memory.db import MemoryDB
+from rocky.memory.emotion import EmotionFSM, EmotionState
+from rocky.memory.monologue import Monologue
 from rocky.memory.policy import (
+    EntityCandidate,
+    EntityRelationCandidate,
     EpisodicCandidate,
     MemoryPolicy,
     MemoryWritePlan,
@@ -29,6 +33,9 @@ RECALL_SEMANTIC_SYSTEM_PROMPT = load_text_file(
 ).strip()
 RECALL_EPISODIC_SYSTEM_PROMPT = load_text_file(
     os.path.join(PROMPTS_DIR, "recall_episodic_system.txt")
+).strip()
+MONOLOGUE_SYSTEM_PROMPT = load_text_file(
+    os.path.join(PROMPTS_DIR, "monologue_system.txt")
 ).strip()
 
 
@@ -58,8 +65,76 @@ class SemanticDocument:
 
 
 @dataclass(slots=True)
+class EntityRelation:
+    from_name: str
+    to_name: str
+    label: str
+    strength: float = 0.5
+
+
+@dataclass(slots=True)
+class EntityRecord:
+    name: str
+    entity_type: str = "person"
+    aliases: list[str] = field(default_factory=list)
+    created_at: str = ""
+    relations: list[EntityRelation] = field(default_factory=list)
+
+
+class EntityStore:
+    VALID_TYPES = {"person", "place", "organization", "concept"}
+
+    def __init__(self):
+        self.entries: list[EntityRecord] = []
+
+    def upsert(
+        self,
+        name: str,
+        entity_type: str = "person",
+        aliases: list[str] | None = None,
+    ) -> EntityRecord:
+        name_lower = name.strip().lower()
+        entity_type = entity_type.strip() if entity_type.strip() in self.VALID_TYPES else "person"
+        existing = next((e for e in self.entries if e.name.lower() == name_lower), None)
+        if existing is not None:
+            existing.entity_type = entity_type
+            existing.aliases = unique_strings((existing.aliases or []) + (aliases or []))
+            return existing
+        record = EntityRecord(
+            name=name.strip(),
+            entity_type=entity_type,
+            aliases=unique_strings(aliases or []),
+        )
+        self.entries.append(record)
+        return record
+
+    def add_relation(self, from_name: str, to_name: str, label: str, strength: float = 0.5) -> None:
+        from_lower = from_name.strip().lower()
+        to_lower = to_name.strip().lower()
+        for entry in self.entries:
+            if entry.name.lower() == from_lower:
+                exists = any(
+                    r.to_name.lower() == to_lower and r.label == label
+                    for r in entry.relations
+                )
+                if not exists:
+                    entry.relations.append(EntityRelation(from_name.strip(), to_name.strip(), label, strength))
+                return
+
+    def get(self, name: str) -> EntityRecord | None:
+        name_lower = name.strip().lower()
+        return next(
+            (e for e in self.entries if e.name.lower() == name_lower or
+             any(a.lower() == name_lower for a in e.aliases)),
+            None,
+        )
+
+
+@dataclass(slots=True)
 class WorkingMemory:
     dialogue: list[HistoryEntry] = field(default_factory=list)
+    monologue: Monologue = field(default_factory=Monologue)
+    emotion: EmotionFSM = field(default_factory=EmotionFSM)
 
     def recent_dialogue(self, limit: int = 6) -> list[HistoryEntry]:
         return self.dialogue[-max(int(limit), 0):]
@@ -70,6 +145,7 @@ class MemoryStore:
     working: WorkingMemory = field(default_factory=WorkingMemory)
     episodic: "EpisodicMemory" = field(default_factory=lambda: EpisodicMemory())
     semantic: "SemanticMemory" = field(default_factory=lambda: SemanticMemory())
+    entity: "EntityStore" = field(default_factory=lambda: EntityStore())
 
 
 class EpisodicMemory:
@@ -155,19 +231,6 @@ class SemanticMemory:
         return entry
 
 
-    def index_entries(self, limit: int | None = None) -> list[dict[str, object]]:
-        entries = self.entries if limit is None else self.entries[-max(int(limit), 0):]
-        return [
-            {
-                "title": entry.title,
-                "aliases": list(entry.aliases),
-                "tags": list(entry.tags),
-                "importance": entry.importance,
-            }
-            for entry in entries
-        ]
-
-
 class MemoryManager:
     def __init__(
         self,
@@ -200,6 +263,18 @@ class MemoryManager:
         return self.memory.semantic
 
     @property
+    def entity(self) -> EntityStore:
+        return self.memory.entity
+
+    @property
+    def monologue(self) -> Monologue:
+        return self.working.monologue
+
+    @property
+    def emotion(self) -> EmotionFSM:
+        return self.working.emotion
+
+    @property
     def dialogue(self) -> list[HistoryEntry]:
         return self.working.dialogue
 
@@ -207,15 +282,15 @@ class MemoryManager:
     def dialogue(self, value: list[HistoryEntry]) -> None:
         self.working.dialogue = list(value)
 
-    def append_user(self, content: str, **metadata):
-        self.working.dialogue.append(HistoryEntry(role="user", content=content, metadata=metadata))
+    def append_user(self, content: str):
+        self.working.dialogue.append(HistoryEntry(role="user", content=content))
 
-    def append_assistant(self, content: str, **metadata):
-        self.working.dialogue.append(HistoryEntry(role="assistant", content=content, metadata=metadata))
+    def append_assistant(self, content: str):
+        self.working.dialogue.append(HistoryEntry(role="assistant", content=content))
 
-    def append_tool(self, tool_name: str, content: str, **metadata):
+    def append_tool(self, tool_name: str, content: str):
         self.working.dialogue.append(
-            HistoryEntry(role="tool", content=content, tool_name=tool_name, metadata=metadata)
+            HistoryEntry(role="tool", content=content, tool_name=tool_name)
         )
 
     def trim_dialogue(self):
@@ -302,9 +377,6 @@ class MemoryManager:
             score -= 2
         return max(0, min(100, score))
 
-    def semantic_index(self) -> list[dict[str, object]]:
-        return self.semantic.index_entries()
-
     def semantic_titles(self, limit: int | None = None) -> list[str]:
         entries = self.semantic.entries if limit is None else self.semantic.entries[-max(int(limit), 0):]
         return [entry.title for entry in entries if entry.title.strip()]
@@ -320,6 +392,32 @@ class MemoryManager:
             if any(alias.strip().lower() == normalized for alias in entry.aliases):
                 return entry
         return None
+
+    def get_entity(self, name: str) -> EntityRecord | None:
+        record = self.entity.get(name)
+        if record is not None:
+            return record
+        row = self.db.load_entity_by_name(name)
+        if row is None:
+            return None
+        return EntityRecord(
+            name=str(row["name"]),
+            entity_type=str(row.get("entity_type") or "person"),
+            aliases=self._parse_tags(row.get("aliases_json") or "[]"),
+            created_at=str(row.get("created_at") or ""),
+        )
+
+    def get_entity_relations(self, name: str) -> list[EntityRelation]:
+        rows = self.db.load_relations_for_entity(name)
+        return [
+            EntityRelation(
+                from_name=str(row["from_name_lower"]),
+                to_name=str(row["to_name_lower"]),
+                label=str(row["relation_label"]),
+                strength=float(row.get("strength") or 0.5),
+            )
+            for row in rows
+        ]
 
     def episodic_summaries_text(self, limit: int | None = None) -> list[str]:
         entries = self.episodic.entries if limit is None else self.episodic.entries[-max(int(limit), 0):]
@@ -517,15 +615,6 @@ class MemoryManager:
             "episodic": episodic_text,
         }
 
-    def build_context(self, query: str, routes: dict[str, bool] | None = None) -> list[str]:
-        routes = routes or self.build_memory_routes(query)
-        recalled = []
-        if routes["semantic"]:
-            recalled.extend(self._selected_semantic_blocks(self._select_relevant_semantic_titles(query)))
-        if routes["episodic"]:
-            recalled.extend(self._selected_episodic_blocks(self._select_relevant_episodic_ids(query)))
-        return recalled
-
     def summarize_dialogue(self, dialogue: list[HistoryEntry]) -> str | None:
         if not dialogue:
             return None
@@ -539,6 +628,32 @@ class MemoryManager:
         )
         summary = self._generate(SUMMARY_SYSTEM_PROMPT, payload, response_format="text").strip()
         return summary or None
+
+    def reflect(self, dialogue: list[HistoryEntry], turn_index: int) -> str | None:
+        if not dialogue:
+            return None
+        try:
+            payload = json.dumps(
+                {"dialogue": self._serialize_dialogue(dialogue[-6:])},
+                ensure_ascii=False,
+                indent=2,
+            )
+            result = self._generate(MONOLOGUE_SYSTEM_PROMPT, payload, response_format="json")
+            thought = str(result.get("thought") or "").strip()
+            emotion = EmotionState.parse(str(result.get("emotion") or ""))
+        except Exception:
+            return None
+        if not thought:
+            return None
+        self.working.monologue.add(thought, turn_index, emotion=emotion)
+        self.working.emotion.transition(emotion)
+        return thought
+
+    def build_monologue_section(self) -> str:
+        return self.working.monologue.build_section()
+
+    def build_emotion_section(self) -> str:
+        return self.working.emotion.current().value
 
     def learn(self, dialogue: list[HistoryEntry], summary: str | None = None) -> MemoryWriteResult:
         payload = json.dumps(
@@ -582,13 +697,21 @@ class MemoryManager:
                 status=status,
             )
 
+        seen_entities: dict[str, EntityCandidate] = {}
+
         for fact in semantic_facts:
             if isinstance(fact, dict):
                 title = str(fact.get("title") or "").strip()
                 content = str(fact.get("content") or "").strip()
+                entity_name = str(fact.get("entity_name") or "").strip()
+                entity_type = str(fact.get("entity_type") or "person").strip()
+                raw_relations = fact.get("relations") or []
             else:
                 title = str(fact).strip()
                 content = (episodic_summary or summary or self._build_excerpt(dialogue)).strip()
+                entity_name = ""
+                entity_type = "person"
+                raw_relations = []
 
             if not title:
                 continue
@@ -602,6 +725,25 @@ class MemoryManager:
                     confidence=confidence,
                 )
             )
+
+            if entity_name:
+                if entity_name not in seen_entities:
+                    seen_entities[entity_name] = EntityCandidate(
+                        name=entity_name,
+                        entity_type=entity_type,
+                    )
+                candidate = seen_entities[entity_name]
+                for rel in raw_relations:
+                    if not isinstance(rel, dict):
+                        continue
+                    to_name = str(rel.get("to") or "").strip()
+                    label = str(rel.get("label") or "").strip()
+                    if to_name and label:
+                        candidate.relations.append(
+                            EntityRelationCandidate(to_name=to_name, label=label)
+                        )
+
+        candidates.entities = list(seen_entities.values())
         return candidates
 
     def _persist_write_plan(self, plan: MemoryWritePlan) -> MemoryWriteResult:
@@ -652,6 +794,34 @@ class MemoryManager:
                     source_episode_ids=entry.source_episode_ids,
                 )
                 result.semantic_written += 1
+
+        for candidate in plan.entities:
+            if not candidate.name.strip():
+                continue
+            self.entity.upsert(
+                name=candidate.name,
+                entity_type=candidate.entity_type,
+                aliases=candidate.aliases,
+            )
+            self.db.upsert_entity(
+                name=candidate.name,
+                entity_type=candidate.entity_type,
+                aliases=candidate.aliases,
+            )
+            for rel in candidate.relations:
+                self.entity.add_relation(
+                    from_name=candidate.name,
+                    to_name=rel.to_name,
+                    label=rel.label,
+                    strength=rel.strength,
+                )
+                self.db.add_entity_relation(
+                    from_name=candidate.name,
+                    to_name=rel.to_name,
+                    relation_label=rel.label,
+                    strength=rel.strength,
+                )
+
         return result
 
     def import_markdown_path(self, path: str | Path) -> list[SemanticDocument]:
@@ -743,26 +913,36 @@ class MemoryManager:
 
     def build_semantic_index_block(self) -> str:
         entries = self._build_semantic_index_entries()
-        if not entries:
-            return ""
+        sections: list[str] = []
 
-        semantic_lines = []
-        for entry in entries:
-            title = str(entry.get("title") or "").strip()
-            if not title:
-                continue
-            aliases = ", ".join(entry.get("aliases") or [])
-            tags = ", ".join(entry.get("tags") or [])
+        if entries:
+            semantic_lines = []
+            for entry in entries:
+                title = str(entry.get("title") or "").strip()
+                if not title:
+                    continue
+                aliases = ", ".join(entry.get("aliases") or [])
+                tags = ", ".join(entry.get("tags") or [])
+                line = f"- title: {title}"
+                if aliases:
+                    line += f" | aliases: {aliases}"
+                if tags:
+                    line += f" | tags: {tags}"
+                semantic_lines.append(line)
+            if semantic_lines:
+                sections.append("Semantic index:\n" + "\n".join(semantic_lines))
 
-            line = f"- title: {title}"
-            if aliases:
-                line += f" | aliases: {aliases}"
+        if self.entity.entries:
+            entity_lines = []
+            for record in self.entity.entries:
+                line = f"- {record.name} ({record.entity_type})"
+                if record.relations:
+                    rel_parts = [f"{r.label} {r.to_name}" for r in record.relations]
+                    line += " | " + ", ".join(rel_parts)
+                entity_lines.append(line)
+            sections.append("Known entities:\n" + "\n".join(entity_lines))
 
-            if tags:
-                line += f" | tags: {tags}"
-            semantic_lines.append(line)
-
-        return "Semantic index:\n" + "\n".join(semantic_lines)
+        return "\n\n".join(sections)
 
 
 
@@ -821,25 +1001,6 @@ class MemoryManager:
                     matches.append(entry.title)
                     break
         return unique_strings(matches)
-
-    def _select_relevant_episodic_ids(self, query: str) -> list[str]:
-        candidate_block, candidate_lookup = self.build_episodic_candidate_block()
-        if not candidate_block.strip():
-            return []
-
-        system_prompt = RECALL_EPISODIC_SYSTEM_PROMPT.format(candidate_block=candidate_block)
-        response = self._generate(system_prompt, query, response_format="json")
-        selected_ids = response.get("selected_ids", [])
-        if not isinstance(selected_ids, list):
-            return []
-
-        cleaned_ids = []
-        for candidate_id in selected_ids:
-            normalized_id = str(candidate_id).strip()
-            if not normalized_id or normalized_id not in candidate_lookup:
-                continue
-            cleaned_ids.append(normalized_id)
-        return cleaned_ids
 
     def _normalize_topic(self, value: str) -> str:
         return value.strip().lower()
@@ -917,21 +1078,6 @@ class MemoryManager:
             )
         return candidates
 
-    def _selected_episodic_blocks(self, selected_ids: list[str]) -> list[str]:
-        blocks = []
-        if not selected_ids:
-            return blocks
-
-        candidate_lookup = self.build_episodic_candidate_block()[1]
-        for candidate_id in selected_ids:
-            entry = candidate_lookup.get(candidate_id)
-            if entry is None:
-                continue
-            formatted = self._format_episodic_prompt_text(entry)
-            if formatted:
-                blocks.append(formatted)
-        return blocks
-
     def _select_relevant_episodic_summaries(self, query: str) -> list[str]:
         candidate_block, candidate_lookup = self.build_episodic_candidate_block()
         if not candidate_block.strip():
@@ -973,18 +1119,6 @@ class MemoryManager:
             if formatted:
                 selected.append(formatted)
         return "\n\n".join(selected).strip()
-
-    def _selected_semantic_blocks(self, selected_topics: list[str]) -> list[str]:
-        blocks = []
-        topic_map = self._build_semantic_topic_lookup()
-        for topic in selected_topics:
-            entry = topic_map.get(self._normalize_topic(topic))
-            if entry is None or entry["kind"] != "semantic":
-                continue
-            cleaned = self._clean_prompt_content(str(entry.get("content") or ""))
-            if cleaned:
-                blocks.append(cleaned)
-        return blocks
 
     def _format_episodic_prompt_text(self, entry: EpisodicEntry) -> str:
         parts = [entry.summary.strip()]
@@ -1050,7 +1184,6 @@ class MemoryManager:
     def _generate(self, system_prompt: str, user_payload: str, response_format: str = "text") -> str | dict:
         prompt = PromptContext(
             system_prompt=system_prompt,
-            context=[],
             dialogue=[user_message(user_payload)],
         )
         raw_response = self.llm.generate_raw(prompt)
@@ -1079,15 +1212,10 @@ class MemoryManager:
                 lines.append(f"{entry.role}: {entry.content}")
         return " | ".join(lines)
 
-    def clear_memory_cache(self):
-        """Clears in-memory cache and reloads from the database."""
-        self.episodic.entries = []
-        self.semantic.entries = []
-        self._load_persisted_entries()
-
     def _load_persisted_entries(self):
         self.episodic.entries = []
         self.semantic.entries = []
+        self.entity.entries = []
 
         episodic_rows = self.db.load_episodic_entries()
         for row in episodic_rows:
@@ -1105,7 +1233,7 @@ class MemoryManager:
                 )
             )
 
-        semantic_rows = self.db.load_semantic_documents()
+        semantic_rows = self.db.load_semantic_entries()
         seen_titles = set()
         for row in semantic_rows:
             title = str(row.get("title") or "").strip()
@@ -1128,6 +1256,33 @@ class MemoryManager:
                 )
             )
 
+
+        entity_rows = self.db.load_entities()
+        relation_rows = self.db.load_entity_relations()
+        relation_map: dict[str, list[EntityRelation]] = {}
+        for row in relation_rows:
+            from_lower = str(row["from_name_lower"])
+            relation_map.setdefault(from_lower, []).append(
+                EntityRelation(
+                    from_name=from_lower,
+                    to_name=str(row["to_name_lower"]),
+                    label=str(row["relation_label"]),
+                    strength=float(row.get("strength") or 0.5),
+                )
+            )
+        for row in entity_rows:
+            name = str(row["name"]).strip()
+            if not name:
+                continue
+            self.entity.entries.append(
+                EntityRecord(
+                    name=name,
+                    entity_type=str(row.get("entity_type") or "person"),
+                    aliases=self._parse_tags(row.get("aliases_json") or "[]"),
+                    created_at=str(row.get("created_at") or ""),
+                    relations=relation_map.get(name.lower(), []),
+                )
+            )
 
     def _parse_tags(self, raw: str) -> list[str]:
         try:

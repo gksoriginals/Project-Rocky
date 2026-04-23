@@ -13,7 +13,7 @@ def _memory_db_path() -> str:
 def _load_semantic_titles(limit: int | None = None) -> list[str]:
     db = MemoryDB(_memory_db_path())
     try:
-        rows = db.load_semantic_documents()
+        rows = db.load_semantic_entries()
     finally:
         db.close()
 

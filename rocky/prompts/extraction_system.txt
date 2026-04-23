@@ -3,7 +3,13 @@ Given a dialogue chunk and an optional summary, return JSON only with this shape
 {
   "episodic_summary": "one short paragraph or null",
   "semantic_facts": [
-    { "title": "short title", "content": "detailed fact or preference" }
+    {
+      "title": "short title",
+      "content": "detailed fact or preference",
+      "entity_name": "Cyril",
+      "entity_type": "person",
+      "relations": [{"to": "Gopi", "label": "friend of"}]
+    }
   ],
   "importance": 1,
   "tags": ["tag1", "tag2"]
@@ -21,4 +27,8 @@ Rules:
 - Keep titles compact but informative, typically 4-10 words.
 - importance must be an integer from 1 to 10.
 - tags should be short topic labels.
+- entity_name, entity_type, and relations are optional. Include them only when the fact is primarily about a named entity.
+- entity_type must be one of: person, place, organization, concept.
+- relations is a list of {"to": "name", "label": "relationship"} pairs, e.g. {"to": "Gopi", "label": "friend of"}.
+- Omit entity_name, entity_type, and relations entirely when the fact is a general preference or unnamed situation.
 - Return valid JSON and nothing else.

@@ -30,11 +30,15 @@ class LLM:
         tools_section,
         semantic_memory="",
         episodic_memory="",
+        monologue="",
+        emotion="neutral",
     ):
         return template.format(
             tools_section=tools_section,
             semantic_memory=semantic_memory,
             episodic_memory=episodic_memory,
+            monologue=monologue,
+            emotion=emotion,
         )
 
     @classmethod
@@ -88,7 +92,6 @@ class Gemma4LLM(LLM):
 
     def build_prompt(self, context: PromptContext):
         prompt_parts = [f"<|turn>system\n{context.system_prompt}<turn|>"]
-        prompt_parts.extend(f"<|turn>system\n{item}<turn|>" for item in context.context)
         prompt_parts.extend(self._format_turn(entry) for entry in context.dialogue)
         prompt_parts.append("<|turn>model\n")
         return "\n".join(prompt_parts)
@@ -157,7 +160,6 @@ class ChatLLM(LLM):
 
     def build_messages(self, context: PromptContext):
         messages = [{"role": "system", "content": context.system_prompt}]
-        messages.extend({"role": "system", "content": item} for item in context.context)
         messages.extend(self._to_message(entry) for entry in context.dialogue)
         return messages
 

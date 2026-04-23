@@ -23,6 +23,7 @@ from rocky.memory.policy import (
     SemanticCandidate,
 )
 from rocky.memory.compaction import CompactionConfig, CompactionTrigger
+from rocky.memory.monologue import Monologue
 from rocky.memory.trigger import MemoryWritePolicy, MemoryWritePolicyConfig
 from rocky.llm import LLM, ChatLLM, Gemma4LLM
 from rocky.events import AgentEvent
@@ -612,11 +613,10 @@ class MemoryTests(unittest.TestCase):
         summary = manager.summarize_dialogue(dialogue)
         manager.learn(dialogue, summary=summary)
 
-        recalled = manager.build_context("concise fuel shortage")
+        semantic_section, episodic_section = manager.build_memory_sections("concise fuel shortage")
 
-        self.assertEqual(len(recalled), 2)
-        self.assertTrue(recalled[0].startswith("User prefers concise answers and discussed fuel shortage."))
-        self.assertTrue(recalled[1].startswith("User prefers concise answers and discussed fuel shortage."))
+        self.assertTrue(semantic_section.startswith("User prefers concise answers and discussed fuel shortage."))
+        self.assertTrue(episodic_section.startswith("User prefers concise answers and discussed fuel shortage."))
 
     def test_memory_manager_reports_loaded_memory_titles(self):
         manager = MemoryManager(dialogue_window=2, db_path=self.db_path)
@@ -669,11 +669,12 @@ class MemoryTests(unittest.TestCase):
         )
 
         report = manager.build_memory_load_report("no thanks")
-        recalled = manager.build_context("no thanks")
+        semantic_section, episodic_section = manager.build_memory_sections("no thanks")
 
         self.assertEqual(report["semantic"], [])
         self.assertEqual(report["episodic"], [])
-        self.assertEqual(recalled, [])
+        self.assertEqual(semantic_section, "")
+        self.assertEqual(episodic_section, "")
 
     def test_memory_manager_summarizes_long_dialogue(self):
         manager = MemoryManager(dialogue_window=1, db_path=self.db_path)
@@ -733,10 +734,9 @@ class MemoryTests(unittest.TestCase):
 
         self.assertEqual(len(reloaded.episodic.entries), 1)
         self.assertEqual(len(reloaded.semantic.entries), 1)
-        recalled = reloaded.build_context("concise answers")
-        self.assertEqual(len(recalled), 2)
-        self.assertTrue(recalled[0].startswith("User prefers concise answers."))
-        self.assertTrue(recalled[1].startswith("User prefers concise answers."))
+        semantic_section, episodic_section = reloaded.build_memory_sections("concise answers")
+        self.assertIn("User prefers concise answers.", semantic_section)
+        self.assertIn("User prefers concise answers.", episodic_section)
 
     def test_memory_manager_snapshot_includes_working_memory(self):
         manager = MemoryManager(dialogue_window=3, db_path=self.db_path)
@@ -1099,6 +1099,304 @@ class MemoryTests(unittest.TestCase):
         self.assertIn("Aliases: Profile", result.stdout)
         self.assertIn("Tags: persona", result.stdout)
 
+    def test_entity_store_upserts_and_merges_aliases(self):
+        manager = MemoryManager(dialogue_window=1, db_path=self.db_path)
+        self.addCleanup(manager.close)
+
+        manager.entity.upsert("Cyril", entity_type="person", aliases=["C"])
+        manager.entity.upsert("Cyril", entity_type="person", aliases=["Cy"])
+
+        record = manager.entity.get("Cyril")
+        self.assertIsNotNone(record)
+        self.assertIn("C", record.aliases)
+        self.assertIn("Cy", record.aliases)
+        self.assertEqual(record.entity_type, "person")
+
+    def test_entity_store_lookup_by_alias(self):
+        manager = MemoryManager(dialogue_window=1, db_path=self.db_path)
+        self.addCleanup(manager.close)
+
+        manager.entity.upsert("San Francisco", entity_type="place", aliases=["SF"])
+
+        self.assertIsNotNone(manager.entity.get("SF"))
+        self.assertIsNone(manager.entity.get("Tokyo"))
+
+    def test_entity_store_records_relations(self):
+        manager = MemoryManager(dialogue_window=1, db_path=self.db_path)
+        self.addCleanup(manager.close)
+
+        manager.entity.upsert("Cyril", entity_type="person")
+        manager.entity.add_relation("Cyril", "Gopi", label="friend of")
+        manager.entity.add_relation("Cyril", "Gopi", label="friend of")  # duplicate — ignored
+
+        record = manager.entity.get("Cyril")
+        self.assertEqual(len(record.relations), 1)
+        self.assertEqual(record.relations[0].to_name, "Gopi")
+        self.assertEqual(record.relations[0].label, "friend of")
+
+    def test_entity_persists_to_db_and_reloads(self):
+        manager = MemoryManager(dialogue_window=1, db_path=self.db_path)
+        self.addCleanup(manager.close)
+
+        manager.db.upsert_entity("Cyril", entity_type="person")
+        manager.db.add_entity_relation("Cyril", "Gopi", "friend of")
+        manager.close()
+
+        reloaded = MemoryManager(dialogue_window=1, db_path=self.db_path)
+        self.addCleanup(reloaded.close)
+
+        record = reloaded.entity.get("Cyril")
+        self.assertIsNotNone(record)
+        self.assertEqual(record.entity_type, "person")
+        relations = reloaded.get_entity_relations("Cyril")
+        self.assertEqual(len(relations), 1)
+        self.assertEqual(relations[0].to_name, "gopi")
+        self.assertEqual(relations[0].label, "friend of")
+
+    def test_learn_extracts_and_persists_entities(self):
+        manager = MemoryManager(dialogue_window=2, db_path=self.db_path)
+        self.addCleanup(manager.close)
+        manager.llm = Mock(
+            generate_raw=Mock(
+                return_value={
+                    "text": json.dumps(
+                        {
+                            "episodic_summary": "User introduced Cyril as a friend.",
+                            "semantic_facts": [
+                                {
+                                    "title": "Cyril's connection to Gopi",
+                                    "content": "Cyril is Gopi's friend.",
+                                    "entity_name": "Cyril",
+                                    "entity_type": "person",
+                                    "relations": [{"to": "Gopi", "label": "friend of"}],
+                                }
+                            ],
+                            "importance": 8,
+                            "tags": ["people"],
+                        }
+                    )
+                }
+            )
+        )
+
+        manager.learn([user_message("My friend Cyril says hi."), assistant_message("Nice to meet him.")])
+
+        record = manager.entity.get("Cyril")
+        self.assertIsNotNone(record)
+        self.assertEqual(record.entity_type, "person")
+        self.assertEqual(len(record.relations), 1)
+        self.assertEqual(record.relations[0].label, "friend of")
+
+    def test_entity_unknown_type_defaults_to_person(self):
+        manager = MemoryManager(dialogue_window=1, db_path=self.db_path)
+        self.addCleanup(manager.close)
+
+        manager.entity.upsert("Xenonite", entity_type="material")
+
+        record = manager.entity.get("Xenonite")
+        self.assertEqual(record.entity_type, "person")
+
+    def test_semantic_index_block_includes_entity_section(self):
+        manager = MemoryManager(dialogue_window=1, db_path=self.db_path)
+        self.addCleanup(manager.close)
+
+        manager.semantic.add_document("Rocky's origin", "Rocky comes from 40 Eridani.")
+        manager.entity.upsert("Cyril", entity_type="person")
+        manager.entity.add_relation("Cyril", "Gopi", label="friend of")
+
+        block = manager.build_semantic_index_block()
+
+        self.assertIn("Semantic index:", block)
+        self.assertIn("Rocky's origin", block)
+        self.assertIn("Known entities:", block)
+        self.assertIn("Cyril (person)", block)
+        self.assertIn("friend of Gopi", block)
+
+    def test_monologue_buffer_rolls_after_max_entries(self):
+        monologue = Monologue(max_entries=3)
+
+        for i in range(5):
+            monologue.add(f"thought {i}", turn_index=i)
+
+        self.assertEqual(len(monologue.entries), 3)
+        self.assertEqual(monologue.entries[0].thought, "thought 2")
+        self.assertEqual(monologue.entries[-1].thought, "thought 4")
+
+    def test_monologue_build_section_formats_entries(self):
+        monologue = Monologue()
+        monologue.add("The user seems uncertain.", turn_index=1)
+        monologue.add("My answer was too dense.", turn_index=2)
+
+        section = monologue.build_section()
+
+        self.assertIn("[Turn 1] The user seems uncertain.", section)
+        self.assertIn("[Turn 2] My answer was too dense.", section)
+
+    def test_monologue_build_section_is_empty_when_no_entries(self):
+        monologue = Monologue()
+
+        self.assertEqual(monologue.build_section(), "")
+
+    def test_monologue_latest_returns_most_recent(self):
+        monologue = Monologue()
+        monologue.add("first", turn_index=1)
+        monologue.add("second", turn_index=2)
+
+        self.assertEqual(monologue.latest().thought, "second")
+
+    def test_monologue_clear_empties_entries(self):
+        monologue = Monologue()
+        monologue.add("thought", turn_index=1)
+        monologue.clear()
+
+        self.assertIsNone(monologue.latest())
+        self.assertEqual(monologue.build_section(), "")
+
+    def test_manager_reflect_stores_thought_in_monologue(self):
+        manager = MemoryManager(dialogue_window=2, db_path=self.db_path)
+        self.addCleanup(manager.close)
+        manager.llm = Mock(
+            generate_raw=Mock(return_value={"text": '{"thought": "The user wants a direct answer.", "emotion": "curious"}'})
+        )
+        dialogue = [
+            user_message("What is the best alloy for hull plating?"),
+            assistant_message("Xenonite works well under pressure."),
+        ]
+
+        thought = manager.reflect(dialogue, turn_index=1)
+
+        self.assertEqual(thought, "The user wants a direct answer.")
+        self.assertEqual(manager.monologue.latest().thought, "The user wants a direct answer.")
+        self.assertEqual(manager.monologue.latest().turn_index, 1)
+        self.assertEqual(manager.monologue.latest().emotion.value, "curious")
+
+    def test_manager_reflect_returns_none_on_llm_failure(self):
+        manager = MemoryManager(dialogue_window=2, db_path=self.db_path)
+        self.addCleanup(manager.close)
+        manager.llm = Mock(generate_raw=Mock(side_effect=RuntimeError("no connection")))
+
+        result = manager.reflect([user_message("hello")], turn_index=1)
+
+        self.assertIsNone(result)
+        self.assertIsNone(manager.monologue.latest())
+
+    def test_manager_reflect_returns_none_on_empty_dialogue(self):
+        manager = MemoryManager(dialogue_window=2, db_path=self.db_path)
+        self.addCleanup(manager.close)
+
+        result = manager.reflect([], turn_index=1)
+
+        self.assertIsNone(result)
+
+    def test_build_monologue_section_proxies_to_working_memory(self):
+        manager = MemoryManager(dialogue_window=2, db_path=self.db_path)
+        self.addCleanup(manager.close)
+        manager.working.monologue.add("Something is unresolved.", turn_index=3)
+
+        section = manager.build_monologue_section()
+
+        self.assertIn("[Turn 3] Something is unresolved.", section)
+
+    def test_system_prompt_includes_monologue_section(self):
+        from rocky.config import SYSTEM_PROMPT
+        from rocky.llm import LLM
+        llm = LLM.build(model="llama3.1")
+        thought = "[Turn 1] The user needs a concrete example."
+
+        prompt = llm.build_system_prompt(SYSTEM_PROMPT, "", monologue=thought)
+
+        self.assertIn("Internal State", prompt)
+        self.assertIn(thought, prompt)
+
+    def test_emotion_fsm_defaults_to_neutral(self):
+        from rocky.memory.emotion import EmotionFSM, EmotionState
+        fsm = EmotionFSM()
+        self.assertEqual(fsm.current(), EmotionState.neutral)
+
+    def test_emotion_fsm_transition_updates_state(self):
+        from rocky.memory.emotion import EmotionFSM, EmotionState
+        fsm = EmotionFSM()
+        fsm.transition(EmotionState.curious)
+        self.assertEqual(fsm.current(), EmotionState.curious)
+
+    def test_emotion_fsm_clear_resets_to_neutral(self):
+        from rocky.memory.emotion import EmotionFSM, EmotionState
+        fsm = EmotionFSM()
+        fsm.transition(EmotionState.excited)
+        fsm.clear()
+        self.assertEqual(fsm.current(), EmotionState.neutral)
+
+    def test_emotion_state_parse_valid(self):
+        from rocky.memory.emotion import EmotionState
+        self.assertEqual(EmotionState.parse("curious"), EmotionState.curious)
+        self.assertEqual(EmotionState.parse("EXCITED"), EmotionState.excited)
+
+    def test_emotion_state_parse_invalid_falls_back_to_neutral(self):
+        from rocky.memory.emotion import EmotionState
+        self.assertEqual(EmotionState.parse("furious"), EmotionState.neutral)
+        self.assertEqual(EmotionState.parse(""), EmotionState.neutral)
+
+    def test_reflect_updates_emotion_fsm(self):
+        manager = MemoryManager(dialogue_window=2, db_path=self.db_path)
+        self.addCleanup(manager.close)
+        manager.llm = Mock(
+            generate_raw=Mock(return_value={"text": '{"thought": "Something interesting.", "emotion": "excited"}'})
+        )
+        dialogue = [user_message("We solved it!"), assistant_message("Amaze!")]
+
+        manager.reflect(dialogue, turn_index=2)
+
+        from rocky.memory.emotion import EmotionState
+        self.assertEqual(manager.emotion.current(), EmotionState.excited)
+
+    def test_reflect_fsm_stays_neutral_on_invalid_emotion(self):
+        manager = MemoryManager(dialogue_window=2, db_path=self.db_path)
+        self.addCleanup(manager.close)
+        manager.llm = Mock(
+            generate_raw=Mock(return_value={"text": '{"thought": "Hmm.", "emotion": "bogus"}'})
+        )
+        dialogue = [user_message("hello"), assistant_message("hi")]
+
+        manager.reflect(dialogue, turn_index=1)
+
+        from rocky.memory.emotion import EmotionState
+        self.assertEqual(manager.emotion.current(), EmotionState.neutral)
+
+    def test_build_emotion_section_returns_state_value(self):
+        manager = MemoryManager(dialogue_window=2, db_path=self.db_path)
+        self.addCleanup(manager.close)
+        from rocky.memory.emotion import EmotionState
+        manager.emotion.transition(EmotionState.concerned)
+
+        self.assertEqual(manager.build_emotion_section(), "concerned")
+
+    def test_reset_session_clears_emotion(self):
+        agent = RockyAgent(model="llama3.1", memory_db_path=self.db_path)
+        from rocky.memory.emotion import EmotionState
+        agent.memory_manager.emotion.transition(EmotionState.satisfied)
+
+        agent.reset_session()
+
+        self.assertEqual(agent.memory_manager.emotion.current(), EmotionState.neutral)
+
+    def test_system_prompt_includes_emotion(self):
+        from rocky.config import SYSTEM_PROMPT
+        from rocky.llm import LLM
+        llm = LLM.build(model="llama3.1")
+
+        prompt = llm.build_system_prompt(SYSTEM_PROMPT, "", emotion="curious")
+
+        self.assertIn("Current emotion: curious", prompt)
+
+    def test_monologue_entry_stores_emotion(self):
+        from rocky.memory.emotion import EmotionState
+        from rocky.memory.monologue import Monologue
+        monologue = Monologue()
+        monologue.add("Interesting problem.", turn_index=1, emotion=EmotionState.curious)
+
+        entry = monologue.latest()
+        self.assertEqual(entry.emotion, EmotionState.curious)
+
     def test_memory_db_persists_session_snapshot(self):
         db = MemoryDB(self.db_path)
         self.addCleanup(db.close)
@@ -1126,7 +1424,7 @@ class MemoryTests(unittest.TestCase):
 
         deleted = db.delete_all_session_snapshots()
         snapshot = db.load_latest_session_snapshot("default")
-        semantic_rows = db.load_semantic_documents()
+        semantic_rows = db.load_semantic_entries()
 
         self.assertGreaterEqual(deleted, 1)
         self.assertIsNone(snapshot)
@@ -1204,7 +1502,6 @@ class AgentTests(unittest.TestCase):
             captured_prompt_contexts.append(
                 {
                     "system_prompt": context.system_prompt,
-                    "context": list(context.context),
                     "dialogue": list(context.dialogue),
                 }
             )
@@ -1237,7 +1534,6 @@ class AgentTests(unittest.TestCase):
         # Memory writing does not trim; only CompactionTrigger (context limit) triggers trim.
         agent.memory_manager.trim_dialogue.assert_not_called()
         self.assertEqual(captured_prompt_contexts[0]["system_prompt"], "sys")
-        self.assertEqual(captured_prompt_contexts[0]["context"], [])
         self.assertEqual([entry.content for entry in captured_prompt_contexts[0]["dialogue"]], ["seed", "old", "hello"])
         self.assertEqual(agent.memory_manager.dialogue[-1].role, "assistant")
         self.assertEqual(agent.session_state.last_answer, "ok")

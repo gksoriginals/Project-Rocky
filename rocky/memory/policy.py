@@ -4,6 +4,21 @@ from dataclasses import dataclass, field
 
 
 @dataclass(slots=True)
+class EntityRelationCandidate:
+    to_name: str
+    label: str
+    strength: float = 0.5
+
+
+@dataclass(slots=True)
+class EntityCandidate:
+    name: str
+    entity_type: str = "person"
+    aliases: list[str] = field(default_factory=list)
+    relations: list[EntityRelationCandidate] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class EpisodicCandidate:
     summary: str
     excerpt: str
@@ -30,6 +45,7 @@ class SemanticCandidate:
 class MemoryWriteCandidateSet:
     episodic: EpisodicCandidate | None = None
     semantic: list[SemanticCandidate] = field(default_factory=list)
+    entities: list[EntityCandidate] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -43,6 +59,7 @@ class MemoryPolicyConfig:
 class MemoryWritePlan:
     episodic: EpisodicCandidate | None = None
     semantic: list[SemanticCandidate] = field(default_factory=list)
+    entities: list[EntityCandidate] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -70,7 +87,11 @@ class MemoryPolicy:
             for candidate in candidates.semantic
             if self.should_store_semantic(candidate)
         ]
-        return MemoryWritePlan(episodic=approved_episode, semantic=approved_semantic)
+        return MemoryWritePlan(
+            episodic=approved_episode,
+            semantic=approved_semantic,
+            entities=list(candidates.entities),
+        )
 
     def should_store_episode(self, candidate: EpisodicCandidate) -> bool:
         if not candidate.summary.strip():

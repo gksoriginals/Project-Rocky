@@ -54,6 +54,31 @@ class MemoryDB:
         self._ensure_column("episodic_records", "status", "TEXT NOT NULL DEFAULT 'resolved'")
         self._ensure_column("semantic_documents", "confidence", "REAL NOT NULL DEFAULT 0.5")
         self._ensure_column("semantic_documents", "source_episode_ids_json", "TEXT NOT NULL DEFAULT '[]'")
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                name_lower TEXT NOT NULL UNIQUE,
+                entity_type TEXT NOT NULL DEFAULT 'person',
+                aliases_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entity_relations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_name_lower TEXT NOT NULL,
+                to_name_lower TEXT NOT NULL,
+                relation_label TEXT NOT NULL,
+                strength REAL NOT NULL DEFAULT 0.5,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(from_name_lower, to_name_lower, relation_label)
+            )
+            """
+        )
         self._conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -62,6 +87,96 @@ class MemoryDB:
         if column in existing:
             return
         self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def upsert_entity(
+        self,
+        name: str,
+        entity_type: str = "person",
+        aliases: list[str] | None = None,
+    ) -> int:
+        name_lower = name.strip().lower()
+        self._conn.execute(
+            """
+            INSERT INTO entities (name, name_lower, entity_type, aliases_json)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(name_lower) DO UPDATE SET
+                entity_type = excluded.entity_type,
+                aliases_json = excluded.aliases_json
+            """,
+            (
+                name.strip(),
+                name_lower,
+                entity_type.strip() or "person",
+                json.dumps(aliases or [], ensure_ascii=False),
+            ),
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            "SELECT id FROM entities WHERE name_lower = ?", (name_lower,)
+        ).fetchone()
+        return int(row["id"]) if row else -1
+
+    def add_entity_relation(
+        self,
+        from_name: str,
+        to_name: str,
+        relation_label: str,
+        strength: float = 0.5,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO entity_relations
+                (from_name_lower, to_name_lower, relation_label, strength)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                from_name.strip().lower(),
+                to_name.strip().lower(),
+                relation_label.strip(),
+                max(0.0, min(float(strength), 1.0)),
+            ),
+        )
+        self._conn.commit()
+
+    def load_entities(self) -> list[dict]:
+        rows = self._conn.execute(
+            """
+            SELECT name, entity_type, aliases_json, created_at
+            FROM entities
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def load_entity_relations(self) -> list[dict]:
+        rows = self._conn.execute(
+            """
+            SELECT from_name_lower, to_name_lower, relation_label, strength
+            FROM entity_relations
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def load_entity_by_name(self, name: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT name, entity_type, aliases_json, created_at FROM entities WHERE name_lower = ?",
+            (name.strip().lower(),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def load_relations_for_entity(self, name: str) -> list[dict]:
+        name_lower = name.strip().lower()
+        rows = self._conn.execute(
+            """
+            SELECT from_name_lower, to_name_lower, relation_label, strength
+            FROM entity_relations
+            WHERE from_name_lower = ? OR to_name_lower = ?
+            ORDER BY id ASC
+            """,
+            (name_lower, name_lower),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def close(self):
         if getattr(self, "_conn", None) is not None:
@@ -104,9 +219,6 @@ class MemoryDB:
             """
         ).fetchall()
         return [dict(row) for row in rows]
-
-    def load_semantic_documents(self) -> list[dict]:
-        return self.load_semantic_entries()
 
     def load_semantic_document_by_title(self, title: str) -> dict | None:
         normalized = title.strip().lower()

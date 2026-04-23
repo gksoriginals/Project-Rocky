@@ -48,15 +48,18 @@ class RockyAgent:
 
     def build_prompt_context(self, query, routes=None):
         semantic_memory, episodic_memory = self.memory_manager.build_memory_sections(query, routes=routes)
+        monologue = self.memory_manager.build_monologue_section()
+        emotion = self.memory_manager.build_emotion_section()
         system_prompt = self.llm.build_system_prompt(
             self.system_prompt_template,
             self.tools_section,
             semantic_memory=semantic_memory,
             episodic_memory=episodic_memory,
+            monologue=monologue,
+            emotion=emotion,
         )
         return PromptContext(
             system_prompt=system_prompt,
-            context=[],
             dialogue=self.memory_manager.dialogue,
         )
 
@@ -145,7 +148,8 @@ class RockyAgent:
         self.memory_manager.db.delete_all_session_snapshots()
         self.memory_manager.delete_all_memory("episodic")
         self.memory_manager.dialogue = []
-        self.turns_since_summary = 0
+        self.memory_manager.monologue.clear()
+        self.memory_manager.emotion.clear()
 
         self.session_state.reset_runtime(notice="Session reset.")
         self.session_state.sync_memory_view(
@@ -474,6 +478,13 @@ class RockyAgent:
                     on_event,
                 )
                 self.memory_manager.append_tool(tool_call["tool"], tool_result)
+
+            thought = self.memory_manager.reflect(
+                self.memory_manager.dialogue,
+                turn_index=self.session_state.turn_index,
+            )
+            if thought:
+                self._record_trace("monologue", thought)
 
             memory_event = self._maybe_write_memory()
             if memory_event is not None:
