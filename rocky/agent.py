@@ -4,8 +4,9 @@ from rocky.config import DEFAULT_DB_PATH, SYSTEM_PROMPT
 from rocky.conversation import PromptContext
 from rocky.events import AgentEvent
 from rocky.llm import LLM
+from rocky.memory.compaction import CompactionTrigger
 from rocky.memory.manager import MemoryManager
-from rocky.memory.trigger import CompactionPolicy
+from rocky.memory.trigger import MemoryWritePolicy
 from rocky.session import SessionState
 from rocky.tools.manager import ToolManager
 from rocky.tools.registry import TOOLS_REGISTRY
@@ -17,14 +18,12 @@ class RockyAgent:
         model=None,
         tools=TOOLS_REGISTRY,
         dialogue_window=6,
-        summarize_every=4,
         memory_db_path=DEFAULT_DB_PATH,
     ):
         self.session_key = "default"
-        self.summarize_every = summarize_every
-        self.turns_since_summary = 0
         self.llm = LLM.build(model=model)
-        self.compaction_policy = CompactionPolicy()
+        self.memory_write_policy = MemoryWritePolicy()
+        self.compaction_trigger = CompactionTrigger()
         self.memory_manager = MemoryManager(
             dialogue_window=dialogue_window,
             llm=self.llm,
@@ -266,81 +265,71 @@ class RockyAgent:
         )
         self.save_session_snapshot()
 
-    def _format_write_result(self, write_result) -> str:
-        episodic = int(getattr(write_result, "episodic_written", 0) or 0)
-        semantic = int(getattr(write_result, "semantic_written", 0) or 0)
-        total = episodic + semantic
-        if total == 0:
-            return "Compaction complete: no durable memory added."
-        return f"Compaction complete: wrote {episodic} episodic, {semantic} semantic."
-
-    def _compact_if_needed(self):
-        self.turns_since_summary += 1
-        decision = self.compaction_policy.evaluate(
-            self.memory_manager.dialogue,
-            turns_since_summary=self.turns_since_summary,
-        )
-        if not decision.should_compact:
-            return None
-
-        summary = self.memory_manager.summarize_dialogue(self.memory_manager.dialogue)
-        if summary is not None:
-            self.session_state.set_notice("Writing episodic/semantic memory...")
-            self._record_trace("memory", "Writing episodic memory...")
-            self._record_trace("memory", "Writing semantic memory...")
-            write_result = self.memory_manager.learn(self.memory_manager.dialogue, summary=summary)
-            self.memory_manager.trim_dialogue()
-            self.turns_since_summary = 0
-            self.session_state.sync_memory_view(
-                snapshot=self.memory_manager.snapshot(),
-                recent_dialogue=self.memory_manager.recent_dialogue(),
-            )
-            detail = self._format_write_result(write_result)
-            self.session_state.set_notice(detail)
-            self._record_trace("memory", detail)
-            return AgentEvent(
-                type="summary_created",
-                payload={
-                    "summary": summary,
-                    "write_result": {
-                        "episodic_written": getattr(write_result, "episodic_written", 0),
-                        "semantic_written": getattr(write_result, "semantic_written", 0),
-                    },
-                },
-            )
-
-        self.turns_since_summary = 0
-        return None
-
-    def force_compact(self):
+    def _do_write_memory(self) -> AgentEvent | None:
         summary = self.memory_manager.summarize_dialogue(self.memory_manager.dialogue)
         if summary is None:
-            self.session_state.set_notice("No dialogue available to compact.")
-            return AgentEvent(type="status_changed", payload={"status": self.session_state.status})
-
+            return None
+        self.session_state.set_notice("Writing episodic/semantic memory...")
         self._record_trace("memory", "Writing episodic memory...")
         self._record_trace("memory", "Writing semantic memory...")
         write_result = self.memory_manager.learn(self.memory_manager.dialogue, summary=summary)
-        self.memory_manager.trim_dialogue()
-        self.turns_since_summary = 0
-        detail = self._format_write_result(write_result)
-        self.session_state.set_notice(detail)
-        self._record_trace("memory", detail)
         self.session_state.sync_memory_view(
             snapshot=self.memory_manager.snapshot(),
             recent_dialogue=self.memory_manager.recent_dialogue(),
         )
-        self.save_session_snapshot()
+        episodic = int(getattr(write_result, "episodic_written", 0) or 0)
+        semantic = int(getattr(write_result, "semantic_written", 0) or 0)
+        total = episodic + semantic
+        detail = (
+            f"Memory write complete: wrote {episodic} episodic, {semantic} semantic."
+            if total > 0
+            else "Memory write complete: no durable memory added."
+        )
+        self.session_state.set_notice(detail)
+        self._record_trace("memory", detail)
         return AgentEvent(
             type="summary_created",
             payload={
                 "summary": summary,
                 "write_result": {
-                    "episodic_written": getattr(write_result, "episodic_written", 0),
-                    "semantic_written": getattr(write_result, "semantic_written", 0),
+                    "episodic_written": episodic,
+                    "semantic_written": semantic,
                 },
             },
         )
+
+    def _maybe_write_memory(self) -> AgentEvent | None:
+        decision = self.memory_write_policy.evaluate(self.memory_manager.dialogue)
+        if not decision.should_write:
+            return None
+        return self._do_write_memory()
+
+    def _compact_if_needed(self, skip_memory_write: bool = False) -> AgentEvent | None:
+        decision = self.compaction_trigger.evaluate(self.memory_manager.dialogue)
+        if not decision.should_compact:
+            return None
+        write_event = None
+        if not skip_memory_write:
+            write_event = self._do_write_memory()
+        self.memory_manager.trim_dialogue()
+        self.session_state.sync_memory_view(
+            snapshot=self.memory_manager.snapshot(),
+            recent_dialogue=self.memory_manager.recent_dialogue(),
+        )
+        return write_event
+
+    def force_compact(self):
+        write_event = self._do_write_memory()
+        if write_event is None:
+            self.session_state.set_notice("No dialogue available to compact.")
+            return AgentEvent(type="status_changed", payload={"status": self.session_state.status})
+        self.memory_manager.trim_dialogue()
+        self.session_state.sync_memory_view(
+            snapshot=self.memory_manager.snapshot(),
+            recent_dialogue=self.memory_manager.recent_dialogue(),
+        )
+        self.save_session_snapshot()
+        return write_event
 
     def process_turn(self, user_input: str, max_turns: int = 5, on_event=None):
         events: list[AgentEvent] = []
@@ -486,9 +475,12 @@ class RockyAgent:
                 )
                 self.memory_manager.append_tool(tool_call["tool"], tool_result)
 
-            summary_event = self._compact_if_needed()
-            if summary_event is not None:
-                self._dispatch_event(summary_event, events, on_event)
+            memory_event = self._maybe_write_memory()
+            if memory_event is not None:
+                self._dispatch_event(memory_event, events, on_event)
+            compact_event = self._compact_if_needed(skip_memory_write=memory_event is not None)
+            if compact_event is not None:
+                self._dispatch_event(compact_event, events, on_event)
             self.session_state.update_status("idle")
             self.session_state.set_notice("Turn complete.")
             self._record_trace_event("status", "Turn complete.", events, on_event)

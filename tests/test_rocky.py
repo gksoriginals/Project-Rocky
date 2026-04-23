@@ -22,7 +22,8 @@ from rocky.memory.policy import (
     MemoryWriteCandidateSet,
     SemanticCandidate,
 )
-from rocky.memory.trigger import CompactionPolicy
+from rocky.memory.compaction import CompactionConfig, CompactionTrigger
+from rocky.memory.trigger import MemoryWritePolicy, MemoryWritePolicyConfig
 from rocky.llm import LLM, ChatLLM, Gemma4LLM
 from rocky.events import AgentEvent
 from rocky.session import SessionState
@@ -917,27 +918,60 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(result.episodic_written, 1)
         self.assertEqual(result.semantic_written, 1)
 
-    def test_compaction_policy_triggers_on_meaningful_signal_before_turn_limit(self):
-        policy = CompactionPolicy()
+    def test_memory_write_policy_triggers_on_explicit_request(self):
+        policy = MemoryWritePolicy()
 
         decision = policy.evaluate(
             [user_message("Please remember this preference: I prefer direct answers.")],
-            turns_since_summary=1,
         )
 
-        self.assertTrue(decision.should_compact)
+        self.assertTrue(decision.should_write)
         self.assertIn("explicit_memory_request", decision.matched_signals)
 
-    def test_compaction_policy_uses_turn_limit_as_fallback(self):
-        policy = CompactionPolicy()
+    def test_memory_write_policy_triggers_on_durable_preference(self):
+        policy = MemoryWritePolicy()
+
+        decision = policy.evaluate(
+            [user_message("I prefer direct answers.")],
+        )
+
+        self.assertTrue(decision.should_write)
+        self.assertIn("durable_preference", decision.matched_signals)
+
+    def test_memory_write_policy_does_not_trigger_on_low_signal_turn(self):
+        policy = MemoryWritePolicy()
 
         decision = policy.evaluate(
             [user_message("okay"), assistant_message("noted")],
-            turns_since_summary=4,
+        )
+
+        self.assertFalse(decision.should_write)
+
+    def test_compaction_trigger_fires_when_dialogue_exceeds_char_limit(self):
+        trigger = CompactionTrigger(CompactionConfig(max_dialogue_chars=50))
+
+        decision = trigger.evaluate(
+            [user_message("a" * 51)],
         )
 
         self.assertTrue(decision.should_compact)
-        self.assertEqual(decision.reason, "turn_limit")
+        self.assertEqual(decision.reason, "context_limit")
+
+    def test_compaction_trigger_does_not_fire_below_char_limit(self):
+        trigger = CompactionTrigger(CompactionConfig(max_dialogue_chars=50))
+
+        decision = trigger.evaluate(
+            [user_message("short")],
+        )
+
+        self.assertFalse(decision.should_compact)
+
+    def test_compaction_trigger_does_not_fire_on_empty_dialogue(self):
+        trigger = CompactionTrigger()
+
+        decision = trigger.evaluate([])
+
+        self.assertFalse(decision.should_compact)
 
     def test_memory_manager_forces_semantic_selection_for_named_entities(self):
         manager = MemoryManager(dialogue_window=2, db_path=self.db_path)
@@ -1114,7 +1148,6 @@ class AgentTests(unittest.TestCase):
         self.agent = RockyAgent(
             model="llama3.1",
             dialogue_window=1,
-            summarize_every=2,
             memory_db_path=self.db_path,
         )
         agent = self.agent
@@ -1153,7 +1186,6 @@ class AgentTests(unittest.TestCase):
         self.agent = RockyAgent(
             model="llama3.1",
             dialogue_window=1,
-            summarize_every=1,
             memory_db_path=self.db_path,
         )
         agent = self.agent
@@ -1165,7 +1197,7 @@ class AgentTests(unittest.TestCase):
         agent.memory_manager.summarize_dialogue = Mock(return_value="summary paragraph")
         agent.memory_manager.learn = Mock()
         agent.memory_manager.trim_dialogue = Mock()
-        agent.compaction_policy.evaluate = Mock(return_value=Mock(should_compact=True))
+        agent.memory_write_policy.evaluate = Mock(return_value=Mock(should_write=True))
         captured_prompt_contexts = []
 
         def capture_stream(context):
@@ -1202,7 +1234,8 @@ class AgentTests(unittest.TestCase):
         learn_dialogue = agent.memory_manager.learn.call_args.args[0]
         self.assertEqual([entry.content for entry in learn_dialogue], ["seed", "old", "hello", "ok"])
         self.assertEqual(agent.memory_manager.learn.call_args.kwargs["summary"], "summary paragraph")
-        agent.memory_manager.trim_dialogue.assert_called_once()
+        # Memory writing does not trim; only CompactionTrigger (context limit) triggers trim.
+        agent.memory_manager.trim_dialogue.assert_not_called()
         self.assertEqual(captured_prompt_contexts[0]["system_prompt"], "sys")
         self.assertEqual(captured_prompt_contexts[0]["context"], [])
         self.assertEqual([entry.content for entry in captured_prompt_contexts[0]["dialogue"]], ["seed", "old", "hello"])
@@ -1228,7 +1261,6 @@ class AgentTests(unittest.TestCase):
         self.agent = RockyAgent(
             model="llama3.1",
             dialogue_window=1,
-            summarize_every=99,
             memory_db_path=self.db_path,
         )
         agent = self.agent
@@ -1263,7 +1295,6 @@ class AgentTests(unittest.TestCase):
         self.agent = RockyAgent(
             model="llama3.1",
             dialogue_window=1,
-            summarize_every=99,
             memory_db_path=self.db_path,
         )
         agent = self.agent
@@ -1291,7 +1322,6 @@ class AgentTests(unittest.TestCase):
         self.agent = RockyAgent(
             model="llama3.1",
             dialogue_window=1,
-            summarize_every=99,
             memory_db_path=self.db_path,
         )
         agent = self.agent
@@ -1335,7 +1365,6 @@ class AgentTests(unittest.TestCase):
         self.agent = RockyAgent(
             model="llama3.1",
             dialogue_window=1,
-            summarize_every=99,
             memory_db_path=self.db_path,
         )
         agent = self.agent
@@ -1376,7 +1405,6 @@ class AgentTests(unittest.TestCase):
         self.agent = RockyAgent(
             model="llama3.1",
             dialogue_window=1,
-            summarize_every=99,
             memory_db_path=self.db_path,
         )
         agent = self.agent
@@ -1394,7 +1422,6 @@ class AgentTests(unittest.TestCase):
         self.agent = RockyAgent(
             model="llama3.1",
             dialogue_window=1,
-            summarize_every=99,
             memory_db_path=self.db_path,
         )
         agent = self.agent
@@ -1411,10 +1438,10 @@ class AgentTests(unittest.TestCase):
         event = agent.force_compact()
 
         self.assertEqual(event.type, "summary_created")
-        self.assertEqual(agent.session_state.notice, "Compaction complete: wrote 1 episodic, 2 semantic.")
+        self.assertEqual(agent.session_state.notice, "Memory write complete: wrote 1 episodic, 2 semantic.")
         self.assertIn("memory", [entry["phase"] for entry in agent.session_state.current_trace])
         self.assertIn(
-            "Compaction complete: wrote 1 episodic, 2 semantic.",
+            "Memory write complete: wrote 1 episodic, 2 semantic.",
             [entry["summary"] for entry in agent.session_state.current_trace],
         )
         agent.memory_manager.learn.assert_called_once()

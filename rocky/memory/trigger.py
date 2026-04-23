@@ -7,21 +7,20 @@ from rocky.conversation import HistoryEntry
 
 
 @dataclass(slots=True)
-class CompactionDecision:
-    should_compact: bool
+class MemoryWriteDecision:
+    should_write: bool
     reason: str = "none"
     priority: int = 0
     matched_signals: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
-class CompactionPolicyConfig:
+class MemoryWritePolicyConfig:
     importance_phrase_bonus: int = 1
     repeated_topic_threshold: int = 2
-    fallback_turn_limit: int = 4
 
 
-class CompactionPolicy:
+class MemoryWritePolicy:
     _EXPLICIT_MEMORY_PATTERNS = (
         "remember this",
         "don't forget",
@@ -55,12 +54,12 @@ class CompactionPolicy:
         "policy",
     )
 
-    def __init__(self, config: CompactionPolicyConfig | None = None):
-        self.config = config or CompactionPolicyConfig()
+    def __init__(self, config: MemoryWritePolicyConfig | None = None):
+        self.config = config or MemoryWritePolicyConfig()
 
-    def evaluate(self, dialogue: list[HistoryEntry], turns_since_summary: int) -> CompactionDecision:
+    def evaluate(self, dialogue: list[HistoryEntry]) -> MemoryWriteDecision:
         if not dialogue:
-            return CompactionDecision(should_compact=False)
+            return MemoryWriteDecision(should_write=False)
 
         matched_signals: list[str] = []
         user_text = "\n".join(
@@ -81,22 +80,14 @@ class CompactionPolicy:
             matched_signals.append("repeated_topic")
 
         if matched_signals:
-            return CompactionDecision(
-                should_compact=True,
+            return MemoryWriteDecision(
+                should_write=True,
                 reason=matched_signals[0],
                 priority=len(matched_signals),
                 matched_signals=matched_signals,
             )
 
-        if turns_since_summary >= self.config.fallback_turn_limit:
-            return CompactionDecision(
-                should_compact=True,
-                reason="turn_limit",
-                priority=1,
-                matched_signals=["turn_limit"],
-            )
-
-        return CompactionDecision(should_compact=False)
+        return MemoryWriteDecision(should_write=False)
 
     def _has_repeated_topic(self, user_text: str) -> bool:
         tokens = [
