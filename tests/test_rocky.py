@@ -15,8 +15,18 @@ from rocky.memory.manager import (
     RECALL_SEMANTIC_SYSTEM_PROMPT,
     ROUTER_SYSTEM_PROMPT,
 )
+from rocky.memory.policy import (
+    EpisodicCandidate,
+    MemoryPolicy,
+    MemoryPolicyConfig,
+    MemoryWriteCandidateSet,
+    SemanticCandidate,
+)
+from rocky.memory.trigger import CompactionPolicy
 from rocky.llm import LLM, ChatLLM, Gemma4LLM
+from rocky.events import AgentEvent
 from rocky.session import SessionState
+from rocky.tracing import TraceLog
 from rocky.tools.manager import ToolManager
 from rocky.tools.registry import TOOLS_REGISTRY
 from rocky.tui.app import (
@@ -435,6 +445,58 @@ class ToolFormattingTests(unittest.TestCase):
         )
         self.assertIn("Stored semantic memory", tui.session_state.notice)
 
+    def test_tui_handle_event_applies_trace_and_stream_updates_incrementally(self):
+        agent = Mock()
+        session_state = SessionState(model_name="m", provider_kind="chat")
+        session_state.add_trace_entry(phase="routing", summary="Semantic memory selected.")
+        agent.get_session_state = Mock(return_value=session_state)
+        tui = RockyTUI(agent)
+        tui._render = Mock()
+
+        tui.handle_event(AgentEvent(type="trace_emitted", payload={"phase": "routing", "summary": "Semantic memory selected."}))
+        tui.handle_event(AgentEvent(type="user_message", payload={"content": "hello"}))
+        tui.handle_event(AgentEvent(type="assistant_delta", payload={"content": "Hi there"}))
+        tui.handle_event(AgentEvent(type="reasoning_update", payload={"content": "Answer directly."}))
+        tui.handle_event(AgentEvent(type="status_changed", payload={"status": "thinking", "notice": "Working"}))
+
+        self.assertEqual(tui.session_state.current_trace[-1]["phase"], "routing")
+        self.assertEqual(tui.session_state.recent_dialogue[0]["role"], "user")
+        self.assertEqual(tui.session_state.recent_dialogue[-1]["content"], "Hi there")
+        self.assertEqual(tui.session_state.last_reasoning, "Answer directly.")
+        self.assertEqual(tui.session_state.status, "thinking")
+        self.assertEqual(tui.session_state.notice, "Working")
+        self.assertGreaterEqual(tui._render.call_count, 5)
+
+    def test_tui_handle_error_event_sets_error_status(self):
+        agent = Mock()
+        session_state = SessionState(model_name="m", provider_kind="chat")
+        agent.get_session_state = Mock(return_value=session_state)
+        tui = RockyTUI(agent)
+        tui._render = Mock()
+
+        tui.handle_event(AgentEvent(type="error", payload={"message": "Failed to connect to Ollama."}))
+
+        self.assertEqual(tui.session_state.status, "error")
+        self.assertEqual(tui.session_state.notice, "Failed to connect to Ollama.")
+
+    def test_tui_trace_event_does_not_duplicate_existing_trace_entry(self):
+        agent = Mock()
+        session_state = SessionState(model_name="m", provider_kind="chat")
+        session_state.add_trace_entry(phase="routing", summary="Semantic memory selected.")
+        agent.get_session_state = Mock(return_value=session_state)
+        tui = RockyTUI(agent)
+        tui._render = Mock()
+
+        tui.handle_event(
+            AgentEvent(
+                type="trace_emitted",
+                payload={"phase": "routing", "summary": "Semantic memory selected."},
+            )
+        )
+
+        self.assertEqual(len(tui.session_state.current_trace), 1)
+        self.assertEqual(tui.session_state.current_trace[0]["phase"], "routing")
+
 
 class AdapterTests(unittest.TestCase):
     def test_base_llm_factory_picks_gemma(self):
@@ -675,6 +737,208 @@ class MemoryTests(unittest.TestCase):
         self.assertTrue(recalled[0].startswith("User prefers concise answers."))
         self.assertTrue(recalled[1].startswith("User prefers concise answers."))
 
+    def test_memory_manager_snapshot_includes_working_memory(self):
+        manager = MemoryManager(dialogue_window=3, db_path=self.db_path)
+        self.addCleanup(manager.close)
+        manager.append_user("Hello")
+        manager.append_assistant("Hi")
+
+        snapshot = manager.snapshot()
+
+        self.assertIn("working", snapshot)
+        self.assertEqual(snapshot["working"]["dialogue_window"], 3)
+        self.assertEqual(snapshot["working"]["active_items"], 2)
+        self.assertEqual(len(snapshot["working"]["recent_dialogue"]), 2)
+        self.assertEqual(snapshot["recent_dialogue"], snapshot["working"]["recent_dialogue"])
+
+    def test_memory_manager_persists_richer_memory_metadata(self):
+        manager = MemoryManager(dialogue_window=2, db_path=self.db_path, session_key="session-42")
+        self.addCleanup(manager.close)
+        manager.llm = Mock(
+            generate_raw=Mock(
+                side_effect=[
+                    {"text": "Earlier context: user discussed memory architecture."},
+                    {
+                        "text": json.dumps(
+                            {
+                                "episodic_summary": "User explored Rocky memory architecture.",
+                                "semantic_facts": [
+                                    {
+                                        "title": "User values lifelike AI behavior",
+                                        "content": "The user wants Rocky to feel intelligent rather than recorder-like.",
+                                    }
+                                ],
+                                "importance": 9,
+                                "tags": ["memory", "architecture"],
+                                "emotion": "engaged",
+                                "episode_type": "technical_discussion",
+                                "status": "open",
+                            }
+                        )
+                    },
+                ]
+            )
+        )
+
+        summary = manager.summarize_dialogue([user_message("Let's design Rocky's memory.")])
+        manager.learn([user_message("Let's design Rocky's memory.")], summary=summary)
+        manager.close()
+
+        reloaded = MemoryManager(dialogue_window=2, db_path=self.db_path, session_key="session-42")
+        self.addCleanup(reloaded.close)
+
+        self.assertEqual(reloaded.episodic.entries[0].episode_type, "technical_discussion")
+        self.assertEqual(reloaded.episodic.entries[0].emotion, "engaged")
+        self.assertEqual(reloaded.episodic.entries[0].source_session_key, "session-42")
+        self.assertEqual(reloaded.episodic.entries[0].status, "open")
+        self.assertAlmostEqual(reloaded.semantic.entries[0].confidence, 0.9)
+
+    def test_memory_manager_builds_candidates_before_persisting(self):
+        manager = MemoryManager(dialogue_window=2, db_path=self.db_path, session_key="session-42")
+        self.addCleanup(manager.close)
+
+        candidates = manager._build_write_candidates(
+            {
+                "episodic_summary": "User refined Rocky memory policy.",
+                "semantic_facts": [
+                    {
+                        "title": "User wants modular memory policy",
+                        "content": "The user wants memory write policy to be easy to tweak.",
+                    }
+                ],
+                "importance": 8,
+                "tags": ["memory", "policy"],
+                "emotion": "engaged",
+                "episode_type": "technical_discussion",
+                "status": "open",
+            },
+            dialogue=[user_message("Let's modularize memory policy.")],
+            summary="User refined Rocky memory policy.",
+        )
+
+        self.assertIsNotNone(candidates.episodic)
+        self.assertEqual(candidates.episodic.episode_type, "technical_discussion")
+        self.assertEqual(candidates.episodic.source_session_key, "session-42")
+        self.assertEqual(candidates.semantic[0].title, "User wants modular memory policy")
+        self.assertAlmostEqual(candidates.semantic[0].confidence, 0.8)
+
+    def test_memory_policy_can_filter_semantic_candidates(self):
+        policy = MemoryPolicy(
+            MemoryPolicyConfig(
+                episodic_min_importance=5,
+                semantic_min_confidence=0.75,
+            )
+        )
+
+        plan = policy.evaluate(
+            MemoryWriteCandidateSet(
+                episodic=EpisodicCandidate(
+                    summary="Useful episode",
+                    excerpt="excerpt",
+                    importance=6,
+                ),
+                semantic=[
+                    SemanticCandidate(title="Keep me", content="durable", confidence=0.8),
+                    SemanticCandidate(title="Drop me", content="weak", confidence=0.4),
+                ],
+            )
+        )
+
+        self.assertIsNotNone(plan.episodic)
+        self.assertEqual([candidate.title for candidate in plan.semantic], ["Keep me"])
+
+    def test_memory_manager_default_policy_drops_low_importance_memory(self):
+        manager = MemoryManager(dialogue_window=1, db_path=self.db_path)
+        self.addCleanup(manager.close)
+        manager.llm = Mock(
+            generate_raw=Mock(
+                return_value={
+                    "text": json.dumps(
+                        {
+                            "episodic_summary": "Low-signal exchange.",
+                            "semantic_facts": ["Temporary preference note."],
+                            "importance": 6,
+                            "tags": ["weak"],
+                        }
+                    )
+                }
+            )
+        )
+
+        manager.learn([user_message("maybe"), assistant_message("okay")])
+
+        self.assertEqual(len(manager.episodic.entries), 0)
+        self.assertEqual(len(manager.semantic.entries), 0)
+
+    def test_memory_manager_default_policy_keeps_unresolved_episode_even_if_low_importance(self):
+        manager = MemoryManager(dialogue_window=1, db_path=self.db_path)
+        self.addCleanup(manager.close)
+        manager.llm = Mock(
+            generate_raw=Mock(
+                return_value={
+                    "text": json.dumps(
+                        {
+                            "episodic_summary": "User left an unresolved follow-up.",
+                            "semantic_facts": [],
+                            "importance": 4,
+                            "tags": ["followup"],
+                            "status": "open",
+                        }
+                    )
+                }
+            )
+        )
+
+        manager.learn([user_message("check later"), assistant_message("I will")])
+
+        self.assertEqual(len(manager.episodic.entries), 1)
+        self.assertEqual(manager.episodic.entries[0].status, "open")
+
+    def test_memory_manager_learn_returns_write_result_counts(self):
+        manager = MemoryManager(dialogue_window=1, db_path=self.db_path)
+        self.addCleanup(manager.close)
+        manager.llm = Mock(
+            generate_raw=Mock(
+                return_value={
+                    "text": json.dumps(
+                        {
+                            "episodic_summary": "Strong memory.",
+                            "semantic_facts": ["Durable preference."],
+                            "importance": 8,
+                            "tags": ["preference"],
+                        }
+                    )
+                }
+            )
+        )
+
+        result = manager.learn([user_message("I prefer direct answers."), assistant_message("Understood.")])
+
+        self.assertEqual(result.episodic_written, 1)
+        self.assertEqual(result.semantic_written, 1)
+
+    def test_compaction_policy_triggers_on_meaningful_signal_before_turn_limit(self):
+        policy = CompactionPolicy()
+
+        decision = policy.evaluate(
+            [user_message("Please remember this preference: I prefer direct answers.")],
+            turns_since_summary=1,
+        )
+
+        self.assertTrue(decision.should_compact)
+        self.assertIn("explicit_memory_request", decision.matched_signals)
+
+    def test_compaction_policy_uses_turn_limit_as_fallback(self):
+        policy = CompactionPolicy()
+
+        decision = policy.evaluate(
+            [user_message("okay"), assistant_message("noted")],
+            turns_since_summary=4,
+        )
+
+        self.assertTrue(decision.should_compact)
+        self.assertEqual(decision.reason, "turn_limit")
+
     def test_memory_manager_forces_semantic_selection_for_named_entities(self):
         manager = MemoryManager(dialogue_window=2, db_path=self.db_path)
         self.addCleanup(manager.close)
@@ -901,6 +1165,7 @@ class AgentTests(unittest.TestCase):
         agent.memory_manager.summarize_dialogue = Mock(return_value="summary paragraph")
         agent.memory_manager.learn = Mock()
         agent.memory_manager.trim_dialogue = Mock()
+        agent.compaction_policy.evaluate = Mock(return_value=Mock(should_compact=True))
         captured_prompt_contexts = []
 
         def capture_stream(context):
@@ -980,10 +1245,16 @@ class AgentTests(unittest.TestCase):
         events = agent.process_turn("hello", max_turns=1)
 
         event_types = [event.type for event in events]
-        self.assertEqual(event_types[0], "status_changed")
-        self.assertEqual(event_types[1], "user_message")
+        self.assertEqual(event_types[0], "trace_emitted")
+        self.assertNotIn("status_changed", event_types)
+        self.assertIn("user_message", event_types)
+        self.assertIn("trace_emitted", event_types)
         self.assertIn("reasoning_update", event_types)
         self.assertIn("assistant_message", event_types)
+        trace_phases = [event.payload.get("phase") for event in events if event.type == "trace_emitted"]
+        self.assertIn("status", trace_phases)
+        self.assertIn("routing", trace_phases)
+        self.assertIn("intent", trace_phases)
         self.assertIn("routing", [entry["phase"] for entry in agent.session_state.current_trace])
         self.assertEqual(agent.session_state.last_reasoning, "Check the memory and answer directly.")
         self.assertEqual(agent.session_state.last_answer, "Here is the answer.")
@@ -1048,8 +1319,11 @@ class AgentTests(unittest.TestCase):
         events = agent.process_turn("hello", max_turns=1)
 
         event_types = [event.type for event in events]
-        self.assertIn("tool_call_started", event_types)
-        self.assertIn("tool_call_result", event_types)
+        self.assertIn("trace_emitted", event_types)
+        self.assertIn("tool_event", event_types)
+        tool_stages = [event.payload.get("stage") for event in events if event.type == "tool_event"]
+        self.assertIn("started", tool_stages)
+        self.assertIn("completed", tool_stages)
         self.assertIn("calling tool: analyze_material(material=steel)", agent.session_state.tool_activity)
         self.assertIn("Strong structural metal. Heavy.", agent.session_state.tool_activity)
         self.assertIn("tool", [entry["phase"] for entry in agent.session_state.current_trace])
@@ -1098,6 +1372,24 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(agent.session_state.last_answer, "Here is the answer.")
         self.assertEqual(agent.session_state.last_reasoning, "Think through it.")
 
+    def test_agent_process_turn_converts_llm_connection_failure_into_error_event(self):
+        self.agent = RockyAgent(
+            model="llama3.1",
+            dialogue_window=1,
+            summarize_every=99,
+            memory_db_path=self.db_path,
+        )
+        agent = self.agent
+        agent.memory_manager.build_memory_routes = Mock(side_effect=ConnectionError("Failed to connect to Ollama."))
+
+        events = agent.process_turn("hello", max_turns=1)
+
+        event_types = [event.type for event in events]
+        self.assertIn("error", event_types)
+        self.assertEqual(agent.session_state.status, "error")
+        self.assertEqual(agent.session_state.notice, "Failed to connect to Ollama.")
+        self.assertIn("error", [entry["phase"] for entry in agent.session_state.current_trace])
+
     def test_agent_force_compact_saves_notice(self):
         self.agent = RockyAgent(
             model="llama3.1",
@@ -1111,20 +1403,108 @@ class AgentTests(unittest.TestCase):
             assistant_message("reply"),
         ]
         agent.memory_manager.summarize_dialogue = Mock(return_value="seed summary")
-        agent.memory_manager.learn = Mock()
+        agent.memory_manager.learn = Mock(
+            return_value=Mock(episodic_written=1, semantic_written=2)
+        )
         agent.memory_manager.trim_dialogue = Mock()
 
         event = agent.force_compact()
 
         self.assertEqual(event.type, "summary_created")
-        self.assertEqual(agent.session_state.notice, "Dialogue compacted into memory.")
+        self.assertEqual(agent.session_state.notice, "Compaction complete: wrote 1 episodic, 2 semantic.")
         self.assertIn("memory", [entry["phase"] for entry in agent.session_state.current_trace])
         self.assertIn(
-            "Memory compaction complete.",
+            "Compaction complete: wrote 1 episodic, 2 semantic.",
             [entry["summary"] for entry in agent.session_state.current_trace],
         )
         agent.memory_manager.learn.assert_called_once()
         agent.memory_manager.trim_dialogue.assert_called_once()
+
+
+class SessionStateTests(unittest.TestCase):
+    def test_trace_log_tracks_current_and_history(self):
+        trace = TraceLog(entry_limit=2, history_limit=2)
+
+        trace.add_entry("status", "Thinking", turn_index=1)
+        trace.add_entry("memory", "semantic", detail="episodic", turn_index=1)
+        trace.add_entry("intent", "answer directly", turn_index=1)
+        trace.commit_current(turn_index=1)
+
+        self.assertEqual(len(trace.current()), 2)
+        self.assertEqual(trace.current()[0]["phase"], "memory")
+        self.assertEqual(trace.current()[1]["phase"], "intent")
+        self.assertEqual(len(trace.history()), 1)
+        self.assertEqual(trace.history()[0]["turn_index"], 1)
+        self.assertEqual(trace.history()[0]["entries"][0]["phase"], "memory")
+
+    def test_session_state_restore_snapshot_and_export_are_core_friendly(self):
+        state = SessionState(model_name="m", provider_kind="chat")
+
+        state.restore_payload(
+            {
+                "status": "thinking",
+                "last_reasoning": "trace it",
+                "last_answer": "answer",
+                "notice": "working",
+                "tool_activity": "calling tool",
+                "turn_index": 4,
+                "active_tool": "inspect",
+                "current_trace": [{"phase": "status", "summary": "Thinking"}],
+                "trace_history": [{"turn_index": 3, "entries": [{"phase": "memory", "summary": "loaded"}]}],
+                "tool_history": [{"name": "inspect", "result": "ok"}],
+                "memory_integrity": 91,
+            }
+        )
+        state.sync_memory_view(
+            snapshot={"integrity": 88, "semantic": [], "episodic": []},
+            recent_dialogue=[{"role": "user", "content": "hello"}],
+        )
+
+        exported = state.export()
+
+        self.assertEqual(state.status, "thinking")
+        self.assertEqual(state.active_tool, "inspect")
+        self.assertEqual(state.memory_integrity, 88)
+        self.assertEqual(state.recent_dialogue[0]["content"], "hello")
+        self.assertEqual(exported["interaction"]["turn_index"], 4)
+        self.assertEqual(exported["tooling"]["active_tool"], "inspect")
+        self.assertEqual(exported["memory_view"]["integrity"], 88)
+        self.assertEqual(exported["trace"]["current"][0]["phase"], "status")
+
+    def test_session_state_trace_properties_proxy_to_trace_log(self):
+        state = SessionState(model_name="m", provider_kind="chat")
+
+        state.current_trace = [{"phase": "status", "summary": "Thinking"}]
+        state.trace_history = [{"turn_index": 1, "entries": [{"phase": "memory", "summary": "loaded"}]}]
+
+        self.assertEqual(state.current_trace[0]["phase"], "status")
+        self.assertEqual(state.trace.current()[0]["phase"], "status")
+        self.assertEqual(state.trace_history[0]["turn_index"], 1)
+        self.assertEqual(state.trace.history()[0]["entries"][0]["phase"], "memory")
+
+    def test_session_state_reset_runtime_clears_runtime_without_requiring_tui(self):
+        state = SessionState(model_name="m", provider_kind="chat")
+        state.status = "thinking"
+        state.turn_index = 7
+        state.last_reasoning = "reasoning"
+        state.last_answer = "answer"
+        state.notice = "busy"
+        state.tool_activity = "calling tool"
+        state.active_tool = "inspect"
+        state.tool_history = [{"name": "inspect"}]
+        state.recent_dialogue = [{"role": "assistant", "content": "hello"}]
+        state.current_trace = [{"phase": "status", "summary": "Thinking"}]
+        state.trace_history = [{"turn_index": 6, "entries": [{"phase": "memory", "summary": "loaded"}]}]
+
+        state.reset_runtime(notice="Reset complete.")
+
+        self.assertEqual(state.status, "idle")
+        self.assertEqual(state.turn_index, 0)
+        self.assertEqual(state.notice, "Reset complete.")
+        self.assertEqual(state.tool_history, [])
+        self.assertEqual(state.recent_dialogue, [])
+        self.assertEqual(state.current_trace, [])
+        self.assertEqual(state.trace_history, [])
 
 
 if __name__ == "__main__":

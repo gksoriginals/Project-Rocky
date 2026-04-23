@@ -4,6 +4,7 @@ import curses
 import re
 import textwrap
 from rocky.agent import RockyAgent
+from rocky.events import AgentEvent
 from rocky.session import SessionState
 
 HEADER_TITLE = "R O C K Y"
@@ -338,8 +339,78 @@ class RockyTUI:
         self._render()
 
     def handle_event(self, event) -> None:
-        self.session_state = self.agent.get_session_state()
+        if not isinstance(event, AgentEvent):
+            self.session_state = self.agent.get_session_state()
+            self._render()
+            return
+
+        payload = event.payload or {}
+        event_type = event.type
+
+        if event_type == "status_changed":
+            status = payload.get("status")
+            if status is not None:
+                self.session_state.update_status(str(status))
+            notice = payload.get("notice")
+            if notice is not None:
+                self.session_state.set_notice(str(notice))
+        elif event_type == "trace_emitted":
+            # The agent already appended this trace entry to the shared SessionState.
+            # For the TUI, this event is just a repaint signal.
+            pass
+        elif event_type == "user_message":
+            content = str(payload.get("content") or "")
+            if content:
+                self.session_state.recent_dialogue = [
+                    *self.session_state.recent_dialogue,
+                    {"role": "user", "content": content},
+                ]
+        elif event_type == "reasoning_update":
+            self.session_state.set_reasoning(str(payload.get("content") or ""))
+        elif event_type == "assistant_delta":
+            content = str(payload.get("content") or "")
+            self.session_state.set_answer(content)
+            self._upsert_assistant_preview(content)
+        elif event_type == "assistant_message":
+            content = str(payload.get("content") or "")
+            self.session_state.set_answer(content)
+            self._upsert_assistant_preview(content)
+        elif event_type == "tool_event":
+            stage = str(payload.get("stage") or "")
+            tool_call = payload.get("tool_call") or {}
+            tool_name = str(tool_call.get("tool") or "")
+            activity = payload.get("activity")
+            if activity is not None:
+                self.session_state.set_tool_activity(str(activity))
+            if stage == "started":
+                self.session_state.record_active_tool(tool_name or None)
+            elif stage == "completed":
+                trace = payload.get("trace")
+                if isinstance(trace, dict):
+                    self.session_state.add_tool_event(trace)
+                    self.session_state.record_active_tool(str(trace.get("name") or "") or None)
+        elif event_type == "memory_snapshot_updated":
+            self.session_state.set_memory_snapshot(payload if isinstance(payload, dict) else {})
+        elif event_type == "summary_created":
+            summary = str(payload.get("summary") or "")
+            if summary:
+                self.session_state.set_notice("Dialogue compacted into memory.")
+        elif event_type == "error":
+            message = str(payload.get("message") or "")
+            self.session_state.update_status("error")
+            if message:
+                self.session_state.set_notice(message)
+        else:
+            self.session_state = self.agent.get_session_state()
         self._render()
+
+    def _upsert_assistant_preview(self, content: str) -> None:
+        recent = list(self.session_state.recent_dialogue)
+        if recent and str(recent[-1].get("role") or "").lower() == "assistant":
+            recent[-1] = {"role": "assistant", "content": content}
+        else:
+            recent.append({"role": "assistant", "content": content})
+        self.session_state.recent_dialogue = recent
 
     def _run_command(self, prompt: str) -> None:
         command, _, remainder = prompt[1:].strip().partition(" ")

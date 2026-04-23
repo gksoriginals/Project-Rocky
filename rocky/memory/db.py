@@ -48,7 +48,20 @@ class MemoryDB:
             )
             """
         )
+        self._ensure_column("episodic_records", "episode_type", "TEXT NOT NULL DEFAULT 'conversation'")
+        self._ensure_column("episodic_records", "emotion", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("episodic_records", "source_session_key", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("episodic_records", "status", "TEXT NOT NULL DEFAULT 'resolved'")
+        self._ensure_column("semantic_documents", "confidence", "REAL NOT NULL DEFAULT 0.5")
+        self._ensure_column("semantic_documents", "source_episode_ids_json", "TEXT NOT NULL DEFAULT '[]'")
         self._conn.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        existing = {str(row[1]) for row in rows}
+        if column in existing:
+            return
+        self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def close(self):
         if getattr(self, "_conn", None) is not None:
@@ -58,7 +71,16 @@ class MemoryDB:
     def load_episodic_entries(self) -> list[dict]:
         rows = self._conn.execute(
             """
-            SELECT summary, excerpt, importance, tags_json
+            SELECT
+                summary,
+                excerpt,
+                importance,
+                tags_json,
+                created_at,
+                episode_type,
+                emotion,
+                source_session_key,
+                status
             FROM episodic_records
             ORDER BY id ASC
             """
@@ -68,7 +90,15 @@ class MemoryDB:
     def load_semantic_entries(self) -> list[dict]:
         rows = self._conn.execute(
             """
-            SELECT title, content, importance, aliases_json, tags_json
+            SELECT
+                title,
+                content,
+                importance,
+                aliases_json,
+                tags_json,
+                created_at,
+                confidence,
+                source_episode_ids_json
             FROM semantic_documents
             ORDER BY id ASC
             """
@@ -85,7 +115,15 @@ class MemoryDB:
 
         rows = self._conn.execute(
             """
-            SELECT title, content, importance, aliases_json, tags_json, created_at
+            SELECT
+                title,
+                content,
+                importance,
+                aliases_json,
+                tags_json,
+                created_at,
+                confidence,
+                source_episode_ids_json
             FROM semantic_documents
             ORDER BY id ASC
             """
@@ -105,7 +143,17 @@ class MemoryDB:
                 return dict(row)
         return None
 
-    def persist_episodic_entry(self, summary: str, excerpt: str, importance: int, tags: list[str]):
+    def persist_episodic_entry(
+        self,
+        summary: str,
+        excerpt: str,
+        importance: int,
+        tags: list[str],
+        episode_type: str = "conversation",
+        emotion: str = "",
+        source_session_key: str = "",
+        status: str = "resolved",
+    ):
         self._conn.execute(
             """
             INSERT OR IGNORE INTO episodic_records (
@@ -113,8 +161,12 @@ class MemoryDB:
                 summary_lower,
                 excerpt,
                 importance,
-                tags_json
-            ) VALUES (?, ?, ?, ?, ?)
+                tags_json,
+                episode_type,
+                emotion,
+                source_session_key,
+                status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 summary,
@@ -122,6 +174,10 @@ class MemoryDB:
                 excerpt,
                 int(importance),
                 json.dumps(tags, ensure_ascii=False),
+                episode_type,
+                emotion,
+                source_session_key,
+                status,
             ),
         )
         self._conn.commit()
@@ -133,6 +189,8 @@ class MemoryDB:
         importance: int,
         aliases: list[str],
         tags: list[str],
+        confidence: float = 0.5,
+        source_episode_ids: list[str] | None = None,
     ):
         self._conn.execute(
             """
@@ -142,8 +200,10 @@ class MemoryDB:
                 content,
                 importance,
                 aliases_json,
-                tags_json
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                tags_json,
+                confidence,
+                source_episode_ids_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 title,
@@ -152,6 +212,8 @@ class MemoryDB:
                 int(importance),
                 json.dumps(aliases, ensure_ascii=False),
                 json.dumps(tags, ensure_ascii=False),
+                float(confidence),
+                json.dumps(source_episode_ids or [], ensure_ascii=False),
             ),
         )
         self._conn.commit()

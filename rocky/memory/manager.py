@@ -9,6 +9,14 @@ from pathlib import Path
 from rocky.conversation import HistoryEntry, PromptContext, user_message
 from rocky.llm import LLM
 from rocky.memory.db import MemoryDB
+from rocky.memory.policy import (
+    EpisodicCandidate,
+    MemoryPolicy,
+    MemoryWritePlan,
+    MemoryWriteResult,
+    MemoryWriteCandidateSet,
+    SemanticCandidate,
+)
 from rocky.utils import load_text_file, parse_json_object, unique_strings
 
 PROMPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "prompts")
@@ -30,6 +38,11 @@ class EpisodicEntry:
     excerpt: str
     importance: int = 5
     tags: list[str] = field(default_factory=list)
+    created_at: str = ""
+    episode_type: str = "conversation"
+    emotion: str = ""
+    source_session_key: str = ""
+    status: str = "resolved"
 
 
 @dataclass(slots=True)
@@ -39,6 +52,24 @@ class SemanticDocument:
     importance: int = 5
     aliases: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
+    created_at: str = ""
+    confidence: float = 0.5
+    source_episode_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class WorkingMemory:
+    dialogue: list[HistoryEntry] = field(default_factory=list)
+
+    def recent_dialogue(self, limit: int = 6) -> list[HistoryEntry]:
+        return self.dialogue[-max(int(limit), 0):]
+
+
+@dataclass(slots=True)
+class MemoryStore:
+    working: WorkingMemory = field(default_factory=WorkingMemory)
+    episodic: "EpisodicMemory" = field(default_factory=lambda: EpisodicMemory())
+    semantic: "SemanticMemory" = field(default_factory=lambda: SemanticMemory())
 
 
 class EpisodicMemory:
@@ -51,6 +82,11 @@ class EpisodicMemory:
         excerpt: str,
         importance: int = 5,
         tags: list[str] | None = None,
+        created_at: str = "",
+        episode_type: str = "conversation",
+        emotion: str = "",
+        source_session_key: str = "",
+        status: str = "resolved",
     ) -> EpisodicEntry | None:
         normalized = summary.strip()
         if not normalized:
@@ -64,6 +100,11 @@ class EpisodicMemory:
             excerpt=excerpt.strip(),
             importance=max(1, min(int(importance), 10)),
             tags=unique_strings(tags or []),
+            created_at=created_at.strip(),
+            episode_type=episode_type.strip() or "conversation",
+            emotion=emotion.strip(),
+            source_session_key=source_session_key.strip(),
+            status=status.strip() or "resolved",
         )
         self.entries.append(entry)
         return entry
@@ -80,6 +121,9 @@ class SemanticMemory:
         importance: int = 5,
         aliases: list[str] | None = None,
         tags: list[str] | None = None,
+        created_at: str = "",
+        confidence: float = 0.5,
+        source_episode_ids: list[str] | None = None,
     ) -> SemanticDocument | None:
         normalized_title = title.strip()
         if not normalized_title:
@@ -98,6 +142,9 @@ class SemanticMemory:
             importance=max(1, min(int(importance), 10)),
             aliases=unique_strings(aliases or []),
             tags=unique_strings(tags or []),
+            created_at=created_at.strip(),
+            confidence=max(0.0, min(float(confidence), 1.0)),
+            source_episode_ids=unique_strings(source_episode_ids or []),
         )
 
         if existing_index is not None:
@@ -122,46 +169,82 @@ class SemanticMemory:
 
 
 class MemoryManager:
-    def __init__(self, dialogue_window: int = 6, llm=None, db_path: str | None = None):
+    def __init__(
+        self,
+        dialogue_window: int = 6,
+        llm=None,
+        db_path: str | None = None,
+        session_key: str = "default",
+    ):
         self.dialogue_window = dialogue_window
         self.llm = llm or LLM.build(
             model=os.getenv("MEMORY_OLLAMA_MODEL", os.getenv("OLLAMA_MODEL", "gemma4:e2b"))
         )
         self.db_path = db_path or os.getenv("ROCKY_MEMORY_DB", "rocky_memory.sqlite3")
+        self.session_key = session_key
         self.db = MemoryDB(self.db_path)
-        self.episodic = EpisodicMemory()
-        self.semantic = SemanticMemory()
-        self.dialogue: list[HistoryEntry] = []
+        self.memory = MemoryStore()
+        self.policy = MemoryPolicy()
         self._load_persisted_entries()
 
+    @property
+    def working(self) -> WorkingMemory:
+        return self.memory.working
+
+    @property
+    def episodic(self) -> EpisodicMemory:
+        return self.memory.episodic
+
+    @property
+    def semantic(self) -> SemanticMemory:
+        return self.memory.semantic
+
+    @property
+    def dialogue(self) -> list[HistoryEntry]:
+        return self.working.dialogue
+
+    @dialogue.setter
+    def dialogue(self, value: list[HistoryEntry]) -> None:
+        self.working.dialogue = list(value)
+
     def append_user(self, content: str, **metadata):
-        self.dialogue.append(HistoryEntry(role="user", content=content, metadata=metadata))
+        self.working.dialogue.append(HistoryEntry(role="user", content=content, metadata=metadata))
 
     def append_assistant(self, content: str, **metadata):
-        self.dialogue.append(HistoryEntry(role="assistant", content=content, metadata=metadata))
+        self.working.dialogue.append(HistoryEntry(role="assistant", content=content, metadata=metadata))
 
     def append_tool(self, tool_name: str, content: str, **metadata):
-        self.dialogue.append(
+        self.working.dialogue.append(
             HistoryEntry(role="tool", content=content, tool_name=tool_name, metadata=metadata)
         )
 
     def trim_dialogue(self):
-        self.dialogue = self.dialogue[-self.dialogue_window:]
+        self.working.dialogue = self.working.dialogue[-self.dialogue_window:]
 
     def close(self):
         self.db.close()
 
     def snapshot(self) -> dict[str, object]:
+        working_snapshot = self.working_memory_snapshot()
         return {
+            "working": working_snapshot,
             "semantic": self.semantic_documents(),
             "episodic": self.episodic_summaries(),
-            "recent_dialogue": self.recent_dialogue(),
+            "recent_dialogue": working_snapshot["recent_dialogue"],
             "last_summary": self.last_summary(),
             "integrity": self.memory_integrity_score(),
         }
 
+    def working_memory_snapshot(self, limit: int = 6) -> dict[str, object]:
+        recent = self.recent_dialogue(limit=limit)
+        return {
+            "recent_dialogue": recent,
+            "dialogue_window": self.dialogue_window,
+            "active_items": len(self.dialogue),
+        }
+
     def recent_dialogue(self, limit: int = 6) -> list[dict[str, object]]:
-        entries = self.dialogue[-max(int(limit), 0):]
+        entries = self.working.recent_dialogue(limit)
         return [
             {
                 "role": entry.role,
@@ -180,6 +263,9 @@ class MemoryManager:
                 "importance": entry.importance,
                 "aliases": list(entry.aliases),
                 "tags": list(entry.tags),
+                "created_at": entry.created_at,
+                "confidence": entry.confidence,
+                "source_episode_ids": list(entry.source_episode_ids),
             }
             for entry in entries
         ]
@@ -192,6 +278,11 @@ class MemoryManager:
                 "excerpt": entry.excerpt,
                 "importance": entry.importance,
                 "tags": list(entry.tags),
+                "created_at": entry.created_at,
+                "episode_type": entry.episode_type,
+                "emotion": entry.emotion,
+                "source_session_key": entry.source_session_key,
+                "status": entry.status,
             }
             for entry in entries
         ]
@@ -249,6 +340,8 @@ class MemoryManager:
         importance: int = 5,
         aliases: list[str] | None = None,
         tags: list[str] | None = None,
+        confidence: float = 0.5,
+        source_episode_ids: list[str] | None = None,
     ) -> SemanticDocument | None:
         entry = self.semantic.add_document(
             title=title,
@@ -256,6 +349,8 @@ class MemoryManager:
             importance=importance,
             aliases=aliases,
             tags=tags,
+            confidence=confidence,
+            source_episode_ids=source_episode_ids,
         )
         if entry is None:
             return None
@@ -265,6 +360,8 @@ class MemoryManager:
             entry.importance,
             entry.aliases,
             entry.tags,
+            confidence=entry.confidence,
+            source_episode_ids=entry.source_episode_ids,
         )
         return entry
 
@@ -443,7 +540,7 @@ class MemoryManager:
         summary = self._generate(SUMMARY_SYSTEM_PROMPT, payload, response_format="text").strip()
         return summary or None
 
-    def learn(self, dialogue: list[HistoryEntry], summary: str | None = None):
+    def learn(self, dialogue: list[HistoryEntry], summary: str | None = None) -> MemoryWriteResult:
         payload = json.dumps(
             {
                 "summary": summary,
@@ -453,23 +550,37 @@ class MemoryManager:
             indent=2,
         )
         extracted = self._generate(EXTRACTION_SYSTEM_PROMPT, payload, response_format="json")
+        candidates = self._build_write_candidates(extracted, dialogue=dialogue, summary=summary)
+        plan = self.policy.evaluate(candidates)
+        return self._persist_write_plan(plan)
 
+    def _build_write_candidates(
+        self,
+        extracted: dict,
+        dialogue: list[HistoryEntry],
+        summary: str | None = None,
+    ) -> MemoryWriteCandidateSet:
         episodic_summary = (extracted.get("episodic_summary") or summary or "").strip()
         semantic_facts = extracted.get("semantic_facts") or []
         importance = extracted.get("importance", 5)
         tags = extracted.get("tags") or []
+        emotion = str(extracted.get("emotion") or "").strip()
+        episode_type = str(extracted.get("episode_type") or "conversation").strip() or "conversation"
+        status = str(extracted.get("status") or "resolved").strip() or "resolved"
+        confidence = max(0.0, min(float(importance) / 10.0, 1.0))
+        candidates = MemoryWriteCandidateSet()
 
         if episodic_summary:
-            entry = self.episodic.add(
+            candidates.episodic = EpisodicCandidate(
                 summary=episodic_summary,
                 excerpt=self._build_excerpt(dialogue),
                 importance=importance,
                 tags=tags,
+                episode_type=episode_type,
+                emotion=emotion,
+                source_session_key=self.session_key,
+                status=status,
             )
-            if entry is not None:
-                self.db.persist_episodic_entry(
-                    entry.summary, entry.excerpt, entry.importance, entry.tags
-                )
 
         for fact in semantic_facts:
             if isinstance(fact, dict):
@@ -482,11 +593,53 @@ class MemoryManager:
             if not title:
                 continue
 
+            candidates.semantic.append(
+                SemanticCandidate(
+                    title=title,
+                    content=content or title,
+                    importance=importance,
+                    tags=tags,
+                    confidence=confidence,
+                )
+            )
+        return candidates
+
+    def _persist_write_plan(self, plan: MemoryWritePlan) -> MemoryWriteResult:
+        result = MemoryWriteResult()
+        if plan.episodic is not None:
+            candidate = plan.episodic
+            entry = self.episodic.add(
+                summary=candidate.summary,
+                excerpt=candidate.excerpt,
+                importance=candidate.importance,
+                tags=candidate.tags,
+                episode_type=candidate.episode_type,
+                emotion=candidate.emotion,
+                source_session_key=candidate.source_session_key,
+                status=candidate.status,
+            )
+            if entry is not None:
+                self.db.persist_episodic_entry(
+                    entry.summary,
+                    entry.excerpt,
+                    entry.importance,
+                    entry.tags,
+                    episode_type=entry.episode_type,
+                    emotion=entry.emotion,
+                    source_session_key=entry.source_session_key,
+                    status=entry.status,
+                )
+                result.episodic_written += 1
+
+        for candidate in plan.semantic:
             entry = self.semantic.add_document(
-                title=title,
-                content=content or title,
-                importance=importance,
-                tags=tags,
+                title=candidate.title,
+                content=candidate.content,
+                importance=candidate.importance,
+                aliases=candidate.aliases,
+                tags=candidate.tags,
+                confidence=candidate.confidence,
+                source_episode_ids=candidate.source_episode_ids,
             )
             if entry is not None:
                 self.db.persist_semantic_document(
@@ -495,7 +648,11 @@ class MemoryManager:
                     entry.importance,
                     entry.aliases,
                     entry.tags,
+                    confidence=entry.confidence,
+                    source_episode_ids=entry.source_episode_ids,
                 )
+                result.semantic_written += 1
+        return result
 
     def import_markdown_path(self, path: str | Path) -> list[SemanticDocument]:
         path = Path(path)
@@ -523,6 +680,8 @@ class MemoryManager:
                 entry.importance,
                 entry.aliases,
                 entry.tags,
+                confidence=entry.confidence,
+                source_episode_ids=entry.source_episode_ids,
             )
             imported.append(entry)
         return imported
@@ -540,6 +699,8 @@ class MemoryManager:
                 entry.importance,
                 entry.aliases,
                 entry.tags,
+                confidence=entry.confidence,
+                source_episode_ids=entry.source_episode_ids,
             )
             imported.append(entry)
         return imported
@@ -936,6 +1097,11 @@ class MemoryManager:
                     excerpt=row["excerpt"],
                     importance=int(row["importance"]),
                     tags=self._parse_tags(row["tags_json"]),
+                    created_at=str(row.get("created_at") or ""),
+                    episode_type=str(row.get("episode_type") or "conversation"),
+                    emotion=str(row.get("emotion") or ""),
+                    source_session_key=str(row.get("source_session_key") or ""),
+                    status=str(row.get("status") or "resolved"),
                 )
             )
 
@@ -956,8 +1122,11 @@ class MemoryManager:
                     importance=int(row.get("importance") or 5),
                     aliases=self._parse_tags(row.get("aliases_json") or "[]"),
                     tags=self._parse_tags(row.get("tags_json") or "[]"),
+                    created_at=str(row.get("created_at") or ""),
+                    confidence=self._parse_confidence(row.get("confidence")),
+                    source_episode_ids=self._parse_tags(row.get("source_episode_ids_json") or "[]"),
                 )
-                )
+            )
 
 
     def _parse_tags(self, raw: str) -> list[str]:
@@ -968,3 +1137,10 @@ class MemoryManager:
         if not isinstance(parsed, list):
             return []
         return unique_strings([str(item) for item in parsed])
+
+    def _parse_confidence(self, raw: object) -> float:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 0.5
+        return max(0.0, min(value, 1.0))

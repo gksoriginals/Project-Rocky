@@ -4,13 +4,13 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 EventType = Literal[
+    "trace_emitted",
     "status_changed",
     "user_message",
     "reasoning_update",
     "assistant_delta",
     "assistant_message",
-    "tool_call_started",
-    "tool_call_result",
+    "tool_event",
     "memory_snapshot_updated",
     "summary_created",
     "error",
