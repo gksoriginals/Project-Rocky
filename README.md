@@ -7,10 +7,11 @@ This project is created for **learning and experimenting with various AI agent c
 ## What Rocky Does
 
 - Runs in a curses-based terminal UI.
-- Keeps a live internal monologue stream for routing, memory loading, tool activity, and reasoning updates.
+- Maintains a lightweight internal state with selective reflection, emotion, and short monologue notes that can steer later replies.
 - Uses separate memory paths for:
   - semantic memory: durable Markdown-backed notes
-  - episodic memory: compacted conversation summaries and excerpts
+  - episodic memory: durable conversation summaries and excerpts learned from important turns
+- Compacts long dialogue into a working-memory summary entry instead of repeatedly carrying the full raw transcript.
 - Routes memory selectively so Rocky does not search memory on low-signal turns like acknowledgements or "no thanks".
 - Supports tool calling through the configured tool registry.
 
@@ -59,7 +60,17 @@ Rocky prefers practical recommendations and tradeoff-based reasoning.
 
 ### Episodic Memory
 
-Episodic memory stores compacted conversation summaries and excerpts. It is used for prior-session and earlier-turn recall when the router decides the query needs it.
+Episodic memory stores learned conversation summaries and excerpts. It is used for prior-session and earlier-turn recall when the router decides the query needs it.
+
+### Working Memory And Compaction
+
+Rocky keeps recent dialogue in working memory. When the conversation gets too large, Rocky compacts older context into a system summary entry so the next turns still carry the important thread without replaying the whole transcript.
+
+Important turns and compaction are intentionally separate:
+
+- important turns use `learn()` to persist episodic and semantic memory
+- compaction uses `summarize_dialogue()` to compress working context
+- if both happen on the same turn, Rocky can reuse the learned episodic summary to avoid an extra model call
 
 ## TUI Commands
 
@@ -71,11 +82,11 @@ Inside the Rocky TUI, you can use the following slash commands:
 - `/memory list [semantic|episodic] [n]`: List stored memories (defaults to semantic).
 - `/memory delete [semantic|episodic] [selector]`: Delete a specific memory by index or title.
 - `/memory delete all [semantic|episodic|all]`: Bulk delete memories.
-- `/compact`: Manually force compaction of the current dialogue into episodic and semantic memory.
+- `/compact`: Manually force compaction of the current dialogue into working-memory summary form.
 - `/tools`: List all tools currently available to Rocky.
 - `/clear`: Clear the visible conversation history from the TUI (does not delete memory).
 - `/reset`: Full session reset—wipes episodic memory and session snapshots while preserving semantic memory.
-- `/help`: Show available commands and их usage.
+- `/help`: Show available commands and their usage.
 - `/quit` or `/exit`: Exit the Rocky session.
 
 ## External CLI Commands
@@ -105,7 +116,7 @@ rocky/
 │   ├── config.py     # Configuration and environment loading
 │   ├── conversation.py
 │   ├── events.py     # Event-driven TUI updates
-│   ├── llm.py        # Provider-agnostic LLM interface (Ollama/OpenAI)
+│   ├── llm.py        # Ollama-backed LLM interface
 │   ├── memory/       # SQLite persistence and memory manager
 │   ├── prompts/      # Externalized system and memory prompts
 │   ├── session.py    # UI-facing session state management
@@ -118,22 +129,13 @@ rocky/
 ## Notes
 
 - **Memory Routing**: Rocky doesn't just search memory every turn; he uses a router to decide when past context is actually needed for the current query.
-- **Compaction**: Dialogue is automatically compacted into episodic and semantic memory every few turns, but you can trigger this manually with `/compact`.
+- **Compaction**: Dialogue is compacted into a working-memory summary when it grows too large, and you can trigger this manually with `/compact`.
+- **Reflection**: Private reflection is gated so Rocky only pays for it on important turns or tool-driven turns.
+- **Prompt Split**: The main reply prompt handles identity, memory, tools, and reply constraints; the monologue prompt carries Rocky's inner decision style and private thought framing.
 - **Durable Storage**: Semantic memory (notes/facts) is persisted across all sessions, while episodic memory is unique to the current interaction timeline.
 
-## What's next
+## Current Direction
 
-### Code changes
-
-1. Create a memory data class and put episodic and semantic inside it. So that we can expand it later to more kind of memories.
-2. Evaluate episodic memory and how it is used. Do we need a physical memory for that or can it be virtual and save to semantic as time goes ?
-3. Evaluate session state class properly and make sure it is modular enough and not tightly built for the TUI.
-4. Emit thoughts instead of emit status. Evaluate AgentEvent as well.
-5. Current traces implementation can be a separate class.
-6. We need to separate working memory and name it working memory.
-
-### Experiments
-
-1. Thoughts/ internal monologue can be a separate module which can act as a feedback to the context that generate and push instructions based on the persona and the situations. A Ralph loop can be used here. This will be part of working memory.
-2. Semantic memory should become more than title and content. It could be people, places, situations tagging people, places and time, facts about people places and time.
-3. Emotions can be part of working memory and it should be a finite state machine where we switch state based on conversations happening. Can be part of compacting. We can redefine compacting to pondering. And this emotions should go to thoughts traces deciding the feedback to the main LLM generating next dialogue/taking actions.
+- Keep reducing hidden model work in the hot path while preserving Rocky's personality.
+- Improve semantic memory structure beyond title/content into richer entity- and relation-aware records.
+- Continue tightening the boundary between outward reply generation and inward reflection/state updates.
