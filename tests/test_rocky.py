@@ -93,8 +93,8 @@ class ToolFormattingTests(unittest.TestCase):
     def test_system_prompt_separates_user_identity_from_rocky(self):
         from rocky.config import SYSTEM_PROMPT
 
-        self.assertIn("Keep Rocky's identity separate from the user's identity.", SYSTEM_PROMPT)
-        self.assertIn("If the user asks who **they** are", SYSTEM_PROMPT)
+        self.assertIn("## Identity Boundary", SYSTEM_PROMPT)
+        self.assertIn('If asked who **they** are, or about "I", "me", "my"', SYSTEM_PROMPT)
         self.assertIn("Do not assume the user is Rocky", SYSTEM_PROMPT)
 
     def test_prompt_section_can_skip_gemma_declarations(self):
