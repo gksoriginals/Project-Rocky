@@ -13,17 +13,26 @@ from rocky.tools.registry import TOOLS_REGISTRY
 
 
 class RockyAgent:
+    VALID_REFLECTION_MODES = {"off", "important_only", "always"}
+
     def __init__(
         self,
         model=None,
         tools=TOOLS_REGISTRY,
         dialogue_window=6,
         memory_db_path=DEFAULT_DB_PATH,
+        reflection_mode="important_only",
     ):
         self.session_key = "default"
         self.llm = LLM.build(model=model)
         self.memory_write_policy = MemoryWritePolicy()
         self.compaction_trigger = CompactionTrigger()
+        normalized_reflection_mode = str(reflection_mode or "important_only").strip().lower()
+        self.reflection_mode = (
+            normalized_reflection_mode
+            if normalized_reflection_mode in self.VALID_REFLECTION_MODES
+            else "important_only"
+        )
         self.memory_manager = MemoryManager(
             dialogue_window=dialogue_window,
             llm=self.llm,
@@ -46,8 +55,12 @@ class RockyAgent:
         )
         self._restore_session_snapshot()
 
-    def build_prompt_context(self, query, routes=None):
-        semantic_memory, episodic_memory = self.memory_manager.build_memory_sections(query, routes=routes)
+    def build_prompt_context(self, query, routes=None, memory_report=None):
+        semantic_memory, episodic_memory = self.memory_manager.build_memory_sections(
+            query,
+            routes=routes,
+            report=memory_report,
+        )
         monologue = self.memory_manager.build_monologue_section()
         emotion = self.memory_manager.build_emotion_section()
         system_prompt = self.llm.build_system_prompt(
@@ -269,14 +282,11 @@ class RockyAgent:
         )
         self.save_session_snapshot()
 
-    def _do_write_memory(self) -> AgentEvent | None:
-        summary = self.memory_manager.summarize_dialogue(self.memory_manager.dialogue)
-        if summary is None:
-            return None
+    def _do_write_memory(self):
         self.session_state.set_notice("Writing episodic/semantic memory...")
         self._record_trace("memory", "Writing episodic memory...")
         self._record_trace("memory", "Writing semantic memory...")
-        write_result = self.memory_manager.learn(self.memory_manager.dialogue, summary=summary)
+        write_result = self.memory_manager.learn(self.memory_manager.dialogue)
         self.session_state.sync_memory_view(
             snapshot=self.memory_manager.snapshot(),
             recent_dialogue=self.memory_manager.recent_dialogue(),
@@ -291,49 +301,50 @@ class RockyAgent:
         )
         self.session_state.set_notice(detail)
         self._record_trace("memory", detail)
-        return AgentEvent(
-            type="summary_created",
-            payload={
-                "summary": summary,
-                "write_result": {
-                    "episodic_written": episodic,
-                    "semantic_written": semantic,
-                },
-            },
-        )
+        return write_result
 
-    def _maybe_write_memory(self) -> AgentEvent | None:
-        decision = self.memory_write_policy.evaluate(self.memory_manager.dialogue)
+    def _maybe_write_memory(self, decision=None):
+        decision = decision or self.memory_write_policy.evaluate(self.memory_manager.dialogue)
         if not decision.should_write:
             return None
         return self._do_write_memory()
 
-    def _compact_if_needed(self, skip_memory_write: bool = False) -> AgentEvent | None:
+    def _should_reflect(self, should_write_memory: bool, used_tools: bool) -> bool:
+        if self.reflection_mode == "off":
+            return False
+        if self.reflection_mode == "always":
+            return True
+        return bool(should_write_memory or used_tools)
+
+    def _compact_dialogue(self, summary: str) -> AgentEvent | None:
+        if not summary:
+            return None
+        self.memory_manager.compact_dialogue(summary)
+        self.session_state.sync_memory_view(
+            snapshot=self.memory_manager.snapshot(),
+            recent_dialogue=self.memory_manager.recent_dialogue(),
+        )
+        self.session_state.set_notice("Dialogue compacted into working memory.")
+        self._record_trace("memory", "Dialogue compacted into working memory.")
+        return AgentEvent(type="summary_created", payload={"summary": summary})
+
+    def _compact_if_needed(self, compaction_summary: str | None = None) -> AgentEvent | None:
         decision = self.compaction_trigger.evaluate(self.memory_manager.dialogue)
         if not decision.should_compact:
             return None
-        write_event = None
-        if not skip_memory_write:
-            write_event = self._do_write_memory()
-        self.memory_manager.trim_dialogue()
-        self.session_state.sync_memory_view(
-            snapshot=self.memory_manager.snapshot(),
-            recent_dialogue=self.memory_manager.recent_dialogue(),
+        summary = str(compaction_summary or "").strip() or self.memory_manager.summarize_dialogue(
+            self.memory_manager.dialogue
         )
-        return write_event
+        return self._compact_dialogue(summary or "")
 
     def force_compact(self):
-        write_event = self._do_write_memory()
-        if write_event is None:
+        summary = self.memory_manager.summarize_dialogue(self.memory_manager.dialogue)
+        if summary is None:
             self.session_state.set_notice("No dialogue available to compact.")
             return AgentEvent(type="status_changed", payload={"status": self.session_state.status})
-        self.memory_manager.trim_dialogue()
-        self.session_state.sync_memory_view(
-            snapshot=self.memory_manager.snapshot(),
-            recent_dialogue=self.memory_manager.recent_dialogue(),
-        )
+        compact_event = self._compact_dialogue(summary)
         self.save_session_snapshot()
-        return write_event
+        return compact_event or AgentEvent(type="status_changed", payload={"status": self.session_state.status})
 
     def process_turn(self, user_input: str, max_turns: int = 5, on_event=None):
         events: list[AgentEvent] = []
@@ -349,15 +360,22 @@ class RockyAgent:
                 events,
                 on_event,
             )
+            used_tools = False
 
             for _ in range(max_turns):
                 response = None
                 routes = self.memory_manager.build_memory_routes(user_input)
+                memory_report = None
                 route_activity = self._format_memory_routes(routes)
                 self.session_state.set_notice(route_activity)
                 self._record_trace_event("routing", route_activity, events, on_event)
                 if routes["semantic"] or routes["episodic"]:
-                    memory_load = self.memory_manager.build_memory_load_summary(user_input, routes=routes)
+                    memory_report = self.memory_manager.build_memory_load_report(user_input, routes=routes)
+                    memory_load = self.memory_manager.build_memory_load_summary(
+                        user_input,
+                        routes=routes,
+                        report=memory_report,
+                    )
                     self._record_trace_event(
                         "memory",
                         memory_load["semantic"],
@@ -365,7 +383,11 @@ class RockyAgent:
                         on_event,
                         detail=memory_load["episodic"],
                     )
-                prompt_context = self.build_prompt_context(user_input, routes=routes)
+                prompt_context = self.build_prompt_context(
+                    user_input,
+                    routes=routes,
+                    memory_report=memory_report,
+                )
                 saw_reasoning_delta = False
                 saw_text_delta = False
                 for response in self._generate_turn_response_stream(prompt_context):
@@ -452,6 +474,7 @@ class RockyAgent:
                     on_event,
                 )
                 tool_result, tool_trace = self.tool_manager.execute_with_trace(tool_call)
+                used_tools = True
                 self._record_tool_event(tool_trace)
                 tool_result_activity = self._format_tool_activity(tool_call, tool_result)
                 self.session_state.set_tool_activity(tool_result_activity)
@@ -479,17 +502,19 @@ class RockyAgent:
                 )
                 self.memory_manager.append_tool(tool_call["tool"], tool_result)
 
-            thought = self.memory_manager.reflect(
-                self.memory_manager.dialogue,
-                turn_index=self.session_state.turn_index,
-            )
-            if thought:
-                self._record_trace("monologue", thought)
+            memory_decision = self.memory_write_policy.evaluate(self.memory_manager.dialogue)
+            if self._should_reflect(memory_decision.should_write, used_tools):
+                thought = self.memory_manager.reflect(
+                    self.memory_manager.dialogue,
+                    turn_index=self.session_state.turn_index,
+                )
+                if thought:
+                    self._record_trace("monologue", thought)
 
-            memory_event = self._maybe_write_memory()
-            if memory_event is not None:
-                self._dispatch_event(memory_event, events, on_event)
-            compact_event = self._compact_if_needed(skip_memory_write=memory_event is not None)
+            memory_result = self._maybe_write_memory(decision=memory_decision)
+            compact_event = self._compact_if_needed(
+                compaction_summary=str(getattr(memory_result, "episodic_summary", "") or ""),
+            )
             if compact_event is not None:
                 self._dispatch_event(compact_event, events, on_event)
             self.session_state.update_status("idle")

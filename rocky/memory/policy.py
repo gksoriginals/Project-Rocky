@@ -66,6 +66,7 @@ class MemoryWritePlan:
 class MemoryWriteResult:
     episodic_written: int = 0
     semantic_written: int = 0
+    episodic_summary: str | None = None
 
     @property
     def total_written(self) -> int:

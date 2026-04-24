@@ -232,6 +232,8 @@ class SemanticMemory:
 
 
 class MemoryManager:
+    COMPACTION_SUMMARY_PREFIX = "Earlier conversation summary:"
+
     def __init__(
         self,
         dialogue_window: int = 6,
@@ -293,8 +295,22 @@ class MemoryManager:
             HistoryEntry(role="tool", content=content, tool_name=tool_name)
         )
 
-    def trim_dialogue(self):
-        self.working.dialogue = self.working.dialogue[-self.dialogue_window:]
+    def compact_dialogue(self, summary: str) -> None:
+        cleaned_summary = str(summary or "").strip()
+        if not cleaned_summary:
+            self.working.dialogue = self.working.dialogue[-self.dialogue_window:]
+            return
+
+        preserved_entries = [
+            entry for entry in self.working.dialogue if not self._is_compaction_summary_entry(entry)
+        ]
+        recent_limit = max(int(self.dialogue_window) - 1, 0)
+        recent_entries = preserved_entries[-recent_limit:] if recent_limit else []
+        summary_entry = HistoryEntry(
+            role="system",
+            content=f"{self.COMPACTION_SUMMARY_PREFIX}\n{cleaned_summary}",
+        )
+        self.working.dialogue = [summary_entry, *recent_entries]
 
     def close(self):
         self.db.close()
@@ -578,10 +594,12 @@ class MemoryManager:
         self,
         query: str,
         routes: dict[str, bool] | None = None,
+        report: dict[str, list[str]] | None = None,
     ) -> tuple[str, str]:
-        routes = routes or self.build_memory_routes(query)
-        semantic_titles = self._select_relevant_semantic_titles(query) if routes["semantic"] else []
-        episodic_summaries = self._select_relevant_episodic_summaries(query) if routes["episodic"] else []
+        if report is None:
+            report = self.build_memory_load_report(query, routes=routes)
+        semantic_titles = report.get("semantic") or []
+        episodic_summaries = report.get("episodic") or []
         semantic_section = self._render_selected_semantic_section(semantic_titles)
         episodic_section = self._render_selected_episodic_section(episodic_summaries)
         return semantic_section, episodic_section
@@ -604,8 +622,9 @@ class MemoryManager:
         self,
         query: str,
         routes: dict[str, bool] | None = None,
+        report: dict[str, list[str]] | None = None,
     ) -> dict[str, str]:
-        report = self.build_memory_load_report(query, routes=routes)
+        report = report or self.build_memory_load_report(query, routes=routes)
         semantic_titles = report.get("semantic") or []
         episodic_summaries = report.get("episodic") or []
         semantic_text = ", ".join(semantic_titles) if semantic_titles else "none"
@@ -655,17 +674,16 @@ class MemoryManager:
     def build_emotion_section(self) -> str:
         return self.working.emotion.current().value
 
-    def learn(self, dialogue: list[HistoryEntry], summary: str | None = None) -> MemoryWriteResult:
+    def learn(self, dialogue: list[HistoryEntry]) -> MemoryWriteResult:
         payload = json.dumps(
             {
-                "summary": summary,
                 "dialogue": self._serialize_dialogue(dialogue),
             },
             ensure_ascii=False,
             indent=2,
         )
         extracted = self._generate(EXTRACTION_SYSTEM_PROMPT, payload, response_format="json")
-        candidates = self._build_write_candidates(extracted, dialogue=dialogue, summary=summary)
+        candidates = self._build_write_candidates(extracted, dialogue=dialogue)
         plan = self.policy.evaluate(candidates)
         return self._persist_write_plan(plan)
 
@@ -673,9 +691,8 @@ class MemoryManager:
         self,
         extracted: dict,
         dialogue: list[HistoryEntry],
-        summary: str | None = None,
     ) -> MemoryWriteCandidateSet:
-        episodic_summary = (extracted.get("episodic_summary") or summary or "").strip()
+        episodic_summary = str(extracted.get("episodic_summary") or "").strip()
         semantic_facts = extracted.get("semantic_facts") or []
         importance = extracted.get("importance", 5)
         tags = extracted.get("tags") or []
@@ -708,7 +725,7 @@ class MemoryManager:
                 raw_relations = fact.get("relations") or []
             else:
                 title = str(fact).strip()
-                content = (episodic_summary or summary or self._build_excerpt(dialogue)).strip()
+                content = (episodic_summary or self._build_excerpt(dialogue)).strip()
                 entity_name = ""
                 entity_type = "person"
                 raw_relations = []
@@ -750,6 +767,7 @@ class MemoryManager:
         result = MemoryWriteResult()
         if plan.episodic is not None:
             candidate = plan.episodic
+            result.episodic_summary = candidate.summary
             entry = self.episodic.add(
                 summary=candidate.summary,
                 excerpt=candidate.excerpt,
@@ -823,6 +841,11 @@ class MemoryManager:
                 )
 
         return result
+
+    def _is_compaction_summary_entry(self, entry: HistoryEntry) -> bool:
+        if entry.role != "system":
+            return False
+        return entry.content.strip().startswith(self.COMPACTION_SUMMARY_PREFIX)
 
     def import_markdown_path(self, path: str | Path) -> list[SemanticDocument]:
         path = Path(path)
@@ -1186,7 +1209,7 @@ class MemoryManager:
             system_prompt=system_prompt,
             dialogue=[user_message(user_payload)],
         )
-        raw_response = self.llm.generate_raw(prompt)
+        raw_response = self.llm.generate_raw(prompt, think=False)
         raw_text = str(raw_response.get("text") or "")
 
         if response_format == "json":

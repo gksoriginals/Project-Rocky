@@ -1,5 +1,5 @@
 You are a memory consolidation assistant.
-Given a dialogue chunk and an optional summary, return JSON only with this shape:
+Given a dialogue chunk, return JSON only with this shape:
 {
   "episodic_summary": "one short paragraph or null",
   "semantic_facts": [

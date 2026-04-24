@@ -48,7 +48,7 @@ class LLM:
             return Gemma4LLM(model=model, client=client)
         return ChatLLM(model=model, client=client)
 
-    def generate_raw(self, context: PromptContext):
+    def generate_raw(self, context: PromptContext, think: bool = True):
         raise NotImplementedError
 
     def generate_stream(self, context: PromptContext):
@@ -96,12 +96,12 @@ class Gemma4LLM(LLM):
         prompt_parts.append("<|turn>model\n")
         return "\n".join(prompt_parts)
 
-    def generate_raw(self, context: PromptContext):
+    def generate_raw(self, context: PromptContext, think: bool = True):
         response = self.client.generate(
             model=self.model,
             prompt=self.build_prompt(context),
             raw=True,
-            think=True,
+            think=think,
         )
         raw = self._dump_response(response)
         return {
@@ -163,11 +163,11 @@ class ChatLLM(LLM):
         messages.extend(self._to_message(entry) for entry in context.dialogue)
         return messages
 
-    def generate_raw(self, context: PromptContext):
+    def generate_raw(self, context: PromptContext, think: bool = True):
         response = self.client.chat(
             model=self.model,
             messages=self.build_messages(context),
-            think=True,
+            think=think,
         )
         raw = self._dump_response(response)
         message = raw.get("message") or {}

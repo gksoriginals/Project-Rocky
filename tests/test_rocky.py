@@ -541,6 +541,28 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(messages[2]["role"], "system")
         self.assertIn("Tool result for analyze_material: good", messages[2]["content"])
 
+    def test_chat_adapter_generate_raw_defaults_to_thinking(self):
+        client = Mock()
+        client.chat.return_value = {"message": {"content": "ok", "thinking": "plan"}}
+        llm = ChatLLM(model="llama3.1", client=client)
+        context = PromptContext(system_prompt="sys", dialogue=[user_message("hello")])
+
+        response = llm.generate_raw(context)
+
+        self.assertEqual(response["text"], "ok")
+        self.assertEqual(response["reasoning"], "plan")
+        self.assertTrue(client.chat.call_args.kwargs["think"])
+
+    def test_gemma_adapter_generate_raw_respects_think_flag(self):
+        client = Mock()
+        client.generate.return_value = {"response": "ok", "thinking": ""}
+        llm = Gemma4LLM(model="gemma4:e2b", client=client)
+        context = PromptContext(system_prompt="sys", dialogue=[user_message("hello")])
+
+        llm.generate_raw(context, think=False)
+
+        self.assertFalse(client.generate.call_args.kwargs["think"])
+
 
 class MemoryTests(unittest.TestCase):
     def setUp(self):
@@ -586,7 +608,6 @@ class MemoryTests(unittest.TestCase):
         manager.llm = Mock(
             generate_raw=Mock(
                 side_effect=[
-                    {"text": "Earlier context: user preference and fuel shortage."},
                     {
                         "text": json.dumps(
                             {
@@ -610,8 +631,7 @@ class MemoryTests(unittest.TestCase):
             assistant_message("Yes, we did."),
         ]
 
-        summary = manager.summarize_dialogue(dialogue)
-        manager.learn(dialogue, summary=summary)
+        manager.learn(dialogue)
 
         semantic_section, episodic_section = manager.build_memory_sections("concise fuel shortage")
 
@@ -690,6 +710,8 @@ class MemoryTests(unittest.TestCase):
 
         self.assertIsNotNone(summary)
         self.assertEqual(summary, "Earlier context: first point and reply one.")
+        manager.llm.generate_raw.assert_called_once()
+        self.assertFalse(manager.llm.generate_raw.call_args.kwargs["think"])
 
     def test_memory_manager_persists_entries_to_sqlite(self):
         manager = MemoryManager(dialogue_window=2, db_path=self.db_path)
@@ -697,7 +719,6 @@ class MemoryTests(unittest.TestCase):
         manager.llm = Mock(
             generate_raw=Mock(
                 side_effect=[
-                    {"text": "Earlier context: user prefers concise answers."},
                     {
                         "text": json.dumps(
                             {
@@ -716,8 +737,7 @@ class MemoryTests(unittest.TestCase):
             assistant_message("Understood."),
         ]
 
-        summary = manager.summarize_dialogue(dialogue)
-        manager.learn(dialogue, summary=summary)
+        manager.learn(dialogue)
         manager.close()
 
         reloaded = MemoryManager(dialogue_window=2, db_path=self.db_path)
@@ -758,7 +778,6 @@ class MemoryTests(unittest.TestCase):
         manager.llm = Mock(
             generate_raw=Mock(
                 side_effect=[
-                    {"text": "Earlier context: user discussed memory architecture."},
                     {
                         "text": json.dumps(
                             {
@@ -781,8 +800,7 @@ class MemoryTests(unittest.TestCase):
             )
         )
 
-        summary = manager.summarize_dialogue([user_message("Let's design Rocky's memory.")])
-        manager.learn([user_message("Let's design Rocky's memory.")], summary=summary)
+        manager.learn([user_message("Let's design Rocky's memory.")])
         manager.close()
 
         reloaded = MemoryManager(dialogue_window=2, db_path=self.db_path, session_key="session-42")
@@ -814,7 +832,6 @@ class MemoryTests(unittest.TestCase):
                 "status": "open",
             },
             dialogue=[user_message("Let's modularize memory policy.")],
-            summary="User refined Rocky memory policy.",
         )
 
         self.assertIsNotNone(candidates.episodic)
@@ -1453,9 +1470,7 @@ class AgentTests(unittest.TestCase):
         agent.memory_manager.dialogue = [user_message("seed")]
         agent.memory_manager.build_memory_routes = Mock(return_value={"semantic": False, "episodic": False})
         agent.memory_manager.build_memory_sections = Mock(return_value=("", ""))
-        agent.memory_manager.summarize_dialogue = Mock(return_value="summary paragraph")
         agent.memory_manager.learn = Mock()
-        agent.memory_manager.trim_dialogue = Mock()
         agent.llm.generate_stream = Mock(
             return_value=iter(
                 [
@@ -1474,9 +1489,7 @@ class AgentTests(unittest.TestCase):
 
         events = agent.process_turn("hello", max_turns=1)
 
-        agent.memory_manager.summarize_dialogue.assert_not_called()
         agent.memory_manager.learn.assert_not_called()
-        agent.memory_manager.trim_dialogue.assert_not_called()
         self.assertEqual(agent.session_state.last_answer, "ok")
         self.assertIn("assistant_message", [event.type for event in events])
 
@@ -1492,9 +1505,9 @@ class AgentTests(unittest.TestCase):
         agent.memory_manager.dialogue = [user_message("seed"), user_message("old")]
         agent.memory_manager.build_memory_routes = Mock(return_value={"semantic": False, "episodic": False})
         agent.memory_manager.build_memory_sections = Mock(return_value=("", ""))
-        agent.memory_manager.summarize_dialogue = Mock(return_value="summary paragraph")
-        agent.memory_manager.learn = Mock()
-        agent.memory_manager.trim_dialogue = Mock()
+        agent.memory_manager.learn = Mock(
+            return_value=Mock(episodic_written=1, semantic_written=0, episodic_summary="summary paragraph")
+        )
         agent.memory_write_policy.evaluate = Mock(return_value=Mock(should_write=True))
         captured_prompt_contexts = []
 
@@ -1522,17 +1535,14 @@ class AgentTests(unittest.TestCase):
         agent.tool_manager.extract_tool_call = Mock(return_value=None)
         events = agent.process_turn("hello", max_turns=1)
 
-        agent.memory_manager.summarize_dialogue.assert_called_once()
         agent.llm.generate_stream.assert_called_once()
         agent.memory_manager.build_memory_sections.assert_called_once_with(
             "hello",
             routes={"semantic": False, "episodic": False},
+            report=None,
         )
         learn_dialogue = agent.memory_manager.learn.call_args.args[0]
         self.assertEqual([entry.content for entry in learn_dialogue], ["seed", "old", "hello", "ok"])
-        self.assertEqual(agent.memory_manager.learn.call_args.kwargs["summary"], "summary paragraph")
-        # Memory writing does not trim; only CompactionTrigger (context limit) triggers trim.
-        agent.memory_manager.trim_dialogue.assert_not_called()
         self.assertEqual(captured_prompt_contexts[0]["system_prompt"], "sys")
         self.assertEqual([entry.content for entry in captured_prompt_contexts[0]["dialogue"]], ["seed", "old", "hello"])
         self.assertEqual(agent.memory_manager.dialogue[-1].role, "assistant")
@@ -1657,6 +1667,7 @@ class AgentTests(unittest.TestCase):
             "calling tool: analyze_material(material=steel)",
             [entry["detail"] for entry in agent.session_state.current_trace if entry["phase"] == "tool"],
         )
+
     def test_agent_process_turn_streams_partial_updates(self):
         self.agent = RockyAgent(
             model="llama3.1",
@@ -1697,6 +1708,197 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(agent.session_state.last_answer, "Here is the answer.")
         self.assertEqual(agent.session_state.last_reasoning, "Think through it.")
 
+    def test_agent_reuses_memory_report_for_trace_and_prompt(self):
+        self.agent = RockyAgent(
+            model="llama3.1",
+            dialogue_window=1,
+            memory_db_path=self.db_path,
+        )
+        agent = self.agent
+        agent.llm.generate_stream = Mock(
+            return_value=iter(
+                [
+                    {
+                        "text_delta": "Answer",
+                        "reasoning_delta": "",
+                        "done": True,
+                        "raw": {},
+                    }
+                ]
+            )
+        )
+        report = {
+            "semantic": ["Rocky's origin"],
+            "episodic": ["We talked about the fuel shortage."],
+        }
+        agent.memory_manager.build_memory_routes = Mock(
+            return_value={"semantic": True, "episodic": True}
+        )
+        agent.memory_manager.build_memory_load_report = Mock(return_value=report)
+        agent.memory_manager.build_memory_load_summary = Mock(
+            wraps=agent.memory_manager.build_memory_load_summary
+        )
+        agent.memory_manager.build_memory_sections = Mock(
+            wraps=agent.memory_manager.build_memory_sections
+        )
+        agent.memory_manager._render_selected_semantic_section = Mock(return_value="semantic section")
+        agent.memory_manager._render_selected_episodic_section = Mock(return_value="episodic section")
+        agent.tool_manager.extract_tool_call = Mock(return_value=None)
+
+        agent.process_turn("hello", max_turns=1)
+
+        agent.memory_manager.build_memory_load_report.assert_called_once_with(
+            "hello",
+            routes={"semantic": True, "episodic": True},
+        )
+        agent.memory_manager.build_memory_load_summary.assert_called_once_with(
+            "hello",
+            routes={"semantic": True, "episodic": True},
+            report=report,
+        )
+        agent.memory_manager.build_memory_sections.assert_called_once_with(
+            "hello",
+            routes={"semantic": True, "episodic": True},
+            report=report,
+        )
+
+    def test_agent_skips_reflection_for_low_signal_turns_by_default(self):
+        self.agent = RockyAgent(
+            model="llama3.1",
+            dialogue_window=1,
+            memory_db_path=self.db_path,
+        )
+        agent = self.agent
+        agent.llm.generate_stream = Mock(
+            return_value=iter(
+                [
+                    {
+                        "text_delta": "Answer",
+                        "reasoning_delta": "",
+                        "done": True,
+                        "raw": {},
+                    }
+                ]
+            )
+        )
+        agent.memory_manager.build_memory_routes = Mock(
+            return_value={"semantic": False, "episodic": False}
+        )
+        agent.memory_manager.build_memory_sections = Mock(return_value=("", ""))
+        agent.memory_manager.reflect = Mock(return_value="private thought")
+        agent.memory_write_policy.evaluate = Mock(return_value=Mock(should_write=False))
+        agent.tool_manager.extract_tool_call = Mock(return_value=None)
+
+        agent.process_turn("hello", max_turns=1)
+
+        agent.memory_manager.reflect.assert_not_called()
+        agent.memory_write_policy.evaluate.assert_called_once()
+
+    def test_agent_reflects_for_tool_turns_in_important_only_mode(self):
+        self.agent = RockyAgent(
+            model="llama3.1",
+            dialogue_window=1,
+            memory_db_path=self.db_path,
+        )
+        agent = self.agent
+        agent.llm.generate_raw = Mock(
+            return_value={
+                "text": "I should call a tool.",
+                "reasoning": "Need a material lookup.",
+                "raw": {},
+            }
+        )
+        agent.memory_manager.reflect = Mock(return_value="private thought")
+        agent.memory_write_policy.evaluate = Mock(return_value=Mock(should_write=False))
+        agent.tool_manager.extract_tool_call = Mock(
+            return_value={"tool": "analyze_material", "args": {"material": "steel"}}
+        )
+        agent.tool_manager.execute_with_trace = Mock(
+            return_value=(
+                "Strong structural metal. Heavy.",
+                {
+                    "name": "analyze_material",
+                    "args": {"material": "steel"},
+                    "result": "Strong structural metal. Heavy.",
+                },
+            )
+        )
+
+        agent.process_turn("hello", max_turns=1)
+
+        agent.memory_manager.reflect.assert_called_once_with(
+            agent.memory_manager.dialogue,
+            turn_index=agent.session_state.turn_index,
+        )
+
+    def test_agent_reflects_when_memory_write_is_worthwhile_in_important_only_mode(self):
+        self.agent = RockyAgent(
+            model="llama3.1",
+            dialogue_window=1,
+            memory_db_path=self.db_path,
+        )
+        agent = self.agent
+        agent.llm.generate_stream = Mock(
+            return_value=iter(
+                [
+                    {
+                        "text_delta": "Answer",
+                        "reasoning_delta": "",
+                        "done": True,
+                        "raw": {},
+                    }
+                ]
+            )
+        )
+        agent.memory_manager.build_memory_routes = Mock(
+            return_value={"semantic": False, "episodic": False}
+        )
+        agent.memory_manager.build_memory_sections = Mock(return_value=("", ""))
+        agent.memory_manager.reflect = Mock(return_value="private thought")
+        agent.memory_manager.learn = Mock()
+        agent.memory_write_policy.evaluate = Mock(return_value=Mock(should_write=True))
+        agent.tool_manager.extract_tool_call = Mock(return_value=None)
+
+        agent.process_turn("hello", max_turns=1)
+
+        agent.memory_manager.reflect.assert_called_once_with(
+            agent.memory_manager.dialogue,
+            turn_index=agent.session_state.turn_index,
+        )
+
+    def test_agent_can_disable_reflection_entirely(self):
+        self.agent = RockyAgent(
+            model="llama3.1",
+            dialogue_window=1,
+            memory_db_path=self.db_path,
+            reflection_mode="off",
+        )
+        agent = self.agent
+        agent.llm.generate_stream = Mock(
+            return_value=iter(
+                [
+                    {
+                        "text_delta": "Answer",
+                        "reasoning_delta": "",
+                        "done": True,
+                        "raw": {},
+                    }
+                ]
+            )
+        )
+        agent.memory_manager.build_memory_routes = Mock(
+            return_value={"semantic": False, "episodic": False}
+        )
+        agent.memory_manager.build_memory_sections = Mock(return_value=("", ""))
+        agent.memory_manager.reflect = Mock(return_value="private thought")
+        agent.memory_write_policy.evaluate = Mock(return_value=Mock(should_write=True))
+        agent.memory_manager.learn = Mock()
+        agent.tool_manager.extract_tool_call = Mock(return_value=None)
+
+        agent.process_turn("hello", max_turns=1)
+
+        agent.memory_manager.reflect.assert_not_called()
+
     def test_agent_process_turn_converts_llm_connection_failure_into_error_event(self):
         self.agent = RockyAgent(
             model="llama3.1",
@@ -1726,22 +1928,19 @@ class AgentTests(unittest.TestCase):
             assistant_message("reply"),
         ]
         agent.memory_manager.summarize_dialogue = Mock(return_value="seed summary")
-        agent.memory_manager.learn = Mock(
-            return_value=Mock(episodic_written=1, semantic_written=2)
-        )
-        agent.memory_manager.trim_dialogue = Mock()
+        agent.memory_manager.compact_dialogue = Mock()
 
         event = agent.force_compact()
 
         self.assertEqual(event.type, "summary_created")
-        self.assertEqual(agent.session_state.notice, "Memory write complete: wrote 1 episodic, 2 semantic.")
+        self.assertEqual(agent.session_state.notice, "Dialogue compacted into working memory.")
         self.assertIn("memory", [entry["phase"] for entry in agent.session_state.current_trace])
         self.assertIn(
-            "Memory write complete: wrote 1 episodic, 2 semantic.",
+            "Dialogue compacted into working memory.",
             [entry["summary"] for entry in agent.session_state.current_trace],
         )
-        agent.memory_manager.learn.assert_called_once()
-        agent.memory_manager.trim_dialogue.assert_called_once()
+        agent.memory_manager.summarize_dialogue.assert_called_once()
+        agent.memory_manager.compact_dialogue.assert_called_once_with("seed summary")
 
 
 class SessionStateTests(unittest.TestCase):
