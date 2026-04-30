@@ -4,7 +4,10 @@ import subprocess
 import tempfile
 import sys
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
+from unittest.mock import patch
 
 from rocky import RockyAgent
 from rocky.conversation import PromptContext, assistant_message, tool_message, user_message
@@ -31,6 +34,12 @@ from rocky.session import SessionState
 from rocky.tracing import TraceLog
 from rocky.tools.manager import ToolManager
 from rocky.tools.registry import TOOLS_REGISTRY
+from rocky.voice.audio_io import FixedWindowRecorder
+from rocky.voice.config import VoiceConfig
+from rocky.voice.session import VoiceSession
+from rocky.voice.stt import Transcript
+from rocky.voice.stt import VoiceDependencyError
+from rocky.voice.tts import PiperTTS
 from rocky.tui.app import (
     RockyTUI,
     build_dialogue_lines,
@@ -40,6 +49,264 @@ from rocky.tui.app import (
     build_telemetry_line,
     build_thought_lines,
 )
+
+
+class VoiceConfigTests(unittest.TestCase):
+    def test_voice_config_reads_environment(self):
+        previous = dict(os.environ)
+        try:
+            os.environ["ROCKY_VOICE_STT"] = "faster-whisper"
+            os.environ["ROCKY_VOICE_STT_MODEL"] = "small"
+            os.environ["ROCKY_VOICE_STT_LANGUAGE"] = "en"
+            os.environ["ROCKY_VOICE_TTS"] = "piper"
+            os.environ["ROCKY_VOICE_NAME"] = "test_voice"
+            os.environ["ROCKY_VOICE_LISTEN_MODE"] = "continuous"
+            os.environ["ROCKY_VOICE_RECORD_MODE"] = "fixed"
+            os.environ["ROCKY_VOICE_RECORD_SECONDS"] = "3.5"
+            os.environ["ROCKY_VOICE_SILENCE_SECONDS"] = "0.7"
+            os.environ["ROCKY_VOICE_SILENCE_THRESHOLD"] = "0.02"
+            os.environ["ROCKY_VOICE_PREROLL_SECONDS"] = "0.4"
+
+            config = VoiceConfig.from_env()
+
+            self.assertEqual(config.stt_backend, "faster-whisper")
+            self.assertEqual(config.stt_model, "small")
+            self.assertEqual(config.stt_language, "en")
+            self.assertEqual(config.tts_backend, "piper")
+            self.assertEqual(config.tts_voice, "test_voice")
+            self.assertEqual(config.listen_mode, "continuous")
+            self.assertEqual(config.record_mode, "fixed")
+            self.assertEqual(config.record_seconds, 3.5)
+            self.assertEqual(config.silence_seconds, 0.7)
+            self.assertEqual(config.silence_threshold, 0.02)
+            self.assertEqual(config.preroll_seconds, 0.4)
+        finally:
+            os.environ.clear()
+            os.environ.update(previous)
+
+    def test_voice_config_defaults_allow_longer_natural_turns(self):
+        config = VoiceConfig()
+
+        self.assertEqual(config.record_seconds, 12.0)
+        self.assertEqual(config.min_record_seconds, 1.5)
+        self.assertEqual(config.silence_seconds, 1.6)
+        self.assertEqual(config.silence_threshold, 0.008)
+        self.assertEqual(config.preroll_seconds, 0.3)
+
+
+class FixedWindowRecorderTests(unittest.TestCase):
+    def test_vad_keeps_preroll_and_counts_min_duration_after_speech_starts(self):
+        try:
+            import numpy as np
+        except Exception:
+            self.skipTest("numpy is not installed")
+
+        block_duration = 0.1
+        block_size = int(16000 * block_duration)
+        levels = [0.0, 0.0, 0.02, 0.02, 0.0, 0.0, 0.0]
+
+        class FakeInputStream:
+            def __init__(self, **_kwargs):
+                self.index = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _block_size):
+                level = levels[self.index]
+                self.index += 1
+                return np.full((block_size, 1), level, dtype="float32"), None
+
+        config = VoiceConfig(
+            record_seconds=1.0,
+            min_record_seconds=0.5,
+            silence_seconds=0.2,
+            silence_threshold=0.01,
+            preroll_seconds=0.2,
+        )
+        recorder = FixedWindowRecorder(config)
+        captured = []
+
+        def fake_write_wav(samples, _np):
+            captured.append(samples)
+            return Path("fake.wav")
+
+        recorder._write_wav = fake_write_wav
+        path = recorder._record_until_silence(np, SimpleNamespace(InputStream=FakeInputStream))
+
+        self.assertEqual(path, Path("fake.wav"))
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].shape[0], block_size * 7)
+
+
+class VoiceSessionTests(unittest.TestCase):
+    def test_run_once_transcribes_processes_synthesizes_and_plays(self):
+        class FakeRecorder:
+            def __init__(self):
+                self.audio_path = Path(tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name)
+                self.audio_path.write_bytes(b"fake audio")
+
+            def record_to_file(self):
+                return self.audio_path
+
+        class FakeSTT:
+            def __init__(self):
+                self.audio_path = None
+
+            def transcribe(self, audio_path):
+                self.audio_path = Path(audio_path)
+                return Transcript(text="hello rocky", language="en")
+
+        class FakeTTS:
+            def __init__(self):
+                self.text = ""
+                self.output_path = None
+
+            def synthesize_to_file(self, text, output_path):
+                self.text = text
+                self.output_path = Path(output_path)
+                self.output_path.write_bytes(b"fake reply")
+                return self.output_path
+
+        class FakePlayer:
+            def __init__(self):
+                self.played_path = None
+
+            def play_file(self, audio_path):
+                self.played_path = Path(audio_path)
+
+        class FakeAgent:
+            def __init__(self):
+                self.session_state = SimpleNamespace(last_answer="")
+                self.user_text = ""
+
+            def process_turn(self, user_text):
+                self.user_text = user_text
+                self.session_state.last_answer = "hi human"
+
+        recorder = FakeRecorder()
+        stt = FakeSTT()
+        tts = FakeTTS()
+        player = FakePlayer()
+        agent = FakeAgent()
+
+        session = VoiceSession(
+            agent,
+            config=VoiceConfig(keep_audio=False),
+            stt=stt,
+            tts=tts,
+            recorder=recorder,
+            player=player,
+        )
+
+        reply = session.run_once()
+
+        self.assertEqual(reply, "hi human")
+        self.assertEqual(agent.user_text, "hello rocky")
+        self.assertEqual(tts.text, "hi human")
+        self.assertEqual(player.played_path, tts.output_path)
+        self.assertFalse(recorder.audio_path.exists())
+        self.assertFalse(tts.output_path.exists())
+
+    def test_load_backends_is_lazy_when_fakes_are_provided(self):
+        agent = SimpleNamespace()
+        stt = SimpleNamespace()
+        tts = SimpleNamespace()
+        session = VoiceSession(agent, config=VoiceConfig(), stt=stt, tts=tts)
+
+        with patch("rocky.voice.session.build_stt") as build_stt, patch("rocky.voice.session.build_tts") as build_tts:
+            session.load_backends()
+
+        build_stt.assert_not_called()
+        build_tts.assert_not_called()
+        self.assertIs(session.stt, stt)
+        self.assertIs(session.tts, tts)
+
+    def test_load_backends_constructs_missing_backends(self):
+        agent = SimpleNamespace()
+        built_stt = SimpleNamespace()
+        built_tts = SimpleNamespace()
+        session = VoiceSession(agent, config=VoiceConfig())
+
+        with patch("rocky.voice.session.build_stt", return_value=built_stt) as build_stt:
+            with patch("rocky.voice.session.build_tts", return_value=built_tts) as build_tts:
+                session.load_backends()
+
+        build_stt.assert_called_once()
+        build_tts.assert_called_once()
+        self.assertIs(session.stt, built_stt)
+        self.assertIs(session.tts, built_tts)
+
+    def test_run_routes_to_push_to_talk_by_default(self):
+        session = VoiceSession(
+            SimpleNamespace(),
+            config=VoiceConfig(),
+            stt=SimpleNamespace(),
+            tts=SimpleNamespace(),
+        )
+
+        with patch.object(session, "_run_push_to_talk", return_value=0) as push_to_talk:
+            with patch.object(session, "_run_continuous", return_value=0) as continuous:
+                result = session.run()
+
+        self.assertEqual(result, 0)
+        push_to_talk.assert_called_once()
+        continuous.assert_not_called()
+
+    def test_run_routes_to_continuous_mode(self):
+        session = VoiceSession(
+            SimpleNamespace(),
+            config=VoiceConfig(listen_mode="continuous"),
+            stt=SimpleNamespace(),
+            tts=SimpleNamespace(),
+        )
+
+        with patch.object(session, "_run_push_to_talk", return_value=0) as push_to_talk:
+            with patch.object(session, "_run_continuous", return_value=0) as continuous:
+                result = session.run()
+
+        self.assertEqual(result, 0)
+        continuous.assert_called_once()
+        push_to_talk.assert_not_called()
+
+
+class PiperTTSTests(unittest.TestCase):
+    def test_piper_requires_matching_json_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "voice.onnx"
+            model.write_bytes(b"fake model")
+
+            with self.assertRaises(VoiceDependencyError) as raised:
+                PiperTTS(str(model))
+
+            self.assertIn("Download the matching .onnx.json file too", str(raised.exception))
+
+    def test_piper_invokes_executable_with_model_and_output_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "voice.onnx"
+            model.write_bytes(b"fake model")
+            model.with_suffix(model.suffix + ".json").write_text("{}", encoding="utf-8")
+            output = Path(directory) / "reply.wav"
+
+            with patch("rocky.voice.tts.subprocess.run") as run:
+                PiperTTS(str(model), executable="piper-bin").synthesize_to_file("hello", output)
+
+            run.assert_called_once_with(
+                [
+                    "piper-bin",
+                    "--model",
+                    str(model),
+                    "--output_file",
+                    str(output),
+                ],
+                input="hello",
+                text=True,
+                check=True,
+                capture_output=True,
+            )
 
 
 class ToolFormattingTests(unittest.TestCase):
@@ -87,15 +354,16 @@ class ToolFormattingTests(unittest.TestCase):
     def test_system_prompt_blocks_meta_narration(self):
         from rocky.config import SYSTEM_PROMPT
 
-        self.assertIn("Do not reveal internal reasoning", SYSTEM_PROMPT)
+        self.assertIn("Internal state is not dialogue.", SYSTEM_PROMPT)
+        self.assertIn("do not quote it or explain it", SYSTEM_PROMPT)
         self.assertNotIn("Before every reply ask internally:", SYSTEM_PROMPT)
 
     def test_system_prompt_separates_user_identity_from_rocky(self):
         from rocky.config import SYSTEM_PROMPT
 
-        self.assertIn("## Identity Boundary", SYSTEM_PROMPT)
-        self.assertIn('If asked who **they** are, or about "I", "me", "my"', SYSTEM_PROMPT)
-        self.assertIn("Do not assume the user is Rocky", SYSTEM_PROMPT)
+        self.assertIn("You are **Rocky**", SYSTEM_PROMPT)
+        self.assertIn("The user is a capable collaborator.", SYSTEM_PROMPT)
+        self.assertIn("You speak as Rocky.", SYSTEM_PROMPT)
 
     def test_prompt_section_can_skip_gemma_declarations(self):
         section = self.tool_manager.get_prompt_section(include_declarations=False)
@@ -1559,7 +1827,7 @@ class AgentTests(unittest.TestCase):
         self.agent = RockyAgent(model="gemma4:e2b", memory_db_path=self.db_path)
         agent = self.agent
 
-        self.assertIn("You are Rocky", agent.system_prompt)
+        self.assertIn("You are **Rocky**", agent.system_prompt)
         self.assertIn("Available tools:", agent.system_prompt)
         self.assertEqual(agent.memory_manager.dialogue, [])
 

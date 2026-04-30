@@ -91,6 +91,20 @@ def _run_memory_search(args: list[str]) -> int:
     return 0
 
 
+def _run_voice() -> int:
+    from rocky.agent import RockyAgent
+    from rocky.config import MODEL_NAME
+    from rocky.voice import VoiceConfig, VoiceSession
+    from rocky.voice.stt import VoiceDependencyError
+
+    agent = RockyAgent(model=MODEL_NAME)
+    try:
+        return VoiceSession(agent, config=VoiceConfig.from_env()).run()
+    except VoiceDependencyError as error:
+        print(str(error))
+        return 1
+
+
 def _normalize_list(raw: object) -> list[str]:
     if isinstance(raw, list):
         return [str(item).strip() for item in raw if str(item).strip()]
@@ -121,6 +135,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args and args[0] == "memory" and len(args) > 1 and args[1] == "search":
         return _run_memory_search(args[2:])
+
+    if args and args[0] == "voice":
+        return _run_voice()
 
     from rocky.agent import RockyAgent
     from rocky.config import MODEL_NAME

@@ -35,6 +35,48 @@ This project is created for **learning and experimenting with various AI agent c
    poetry run python rocky.py
    ```
 
+4. **Launch voice mode**:
+   ```bash
+   poetry run python rocky.py voice
+   ```
+
+   Voice mode keeps Ollama/Gemma 4 as Rocky's reasoning model and uses separate local
+   speech backends around it. First make sure the base Poetry environment exists:
+
+   ```bash
+   poetry install
+   ```
+
+   Then install the voice runtime packages. For Piper TTS:
+
+   ```bash
+   poetry run pip install faster-whisper sounddevice soundfile numpy piper-tts
+   mkdir -p models/piper
+   curl -L "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx" \
+     -o models/piper/en_US-lessac-medium.onnx
+   curl -L "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json" \
+     -o models/piper/en_US-lessac-medium.onnx.json
+   ```
+
+   Useful environment variables:
+
+   ```env
+   ROCKY_VOICE_STT=faster-whisper
+   ROCKY_VOICE_STT_MODEL=large-v3-turbo
+   ROCKY_VOICE_TTS=piper
+   ROCKY_PIPER_MODEL=models/piper/en_US-lessac-medium.onnx
+   ROCKY_VOICE_LISTEN_MODE=continuous
+   ROCKY_VOICE_RECORD_MODE=vad
+   ROCKY_VOICE_RECORD_SECONDS=12
+   ROCKY_VOICE_SILENCE_SECONDS=1.6
+   ```
+
+   If your `piper` executable is not on PATH, set it explicitly:
+
+   ```env
+   ROCKY_PIPER_EXECUTABLE=/absolute/path/to/piper
+   ```
+
 ## Memory Model
 
 ### Semantic Memory
@@ -88,6 +130,31 @@ Inside the Rocky TUI, you can use the following slash commands:
 - `/reset`: Full session reset—wipes episodic memory and session snapshots while preserving semantic memory.
 - `/help`: Show available commands and their usage.
 - `/quit` or `/exit`: Exit the Rocky session.
+
+## Voice Mode
+
+Voice mode is intentionally a layer around the existing text agent:
+
+```text
+microphone -> STT transcript -> RockyAgent -> TTS audio -> speaker
+```
+
+Voice mode can run push-to-talk or continuous listening. Push-to-talk waits for Enter before
+each turn; continuous listening automatically starts each new turn after Rocky finishes speaking.
+
+By default, voice mode now records until silence or until `ROCKY_VOICE_RECORD_SECONDS`
+is reached. VAD keeps a short pre-roll and measures the minimum utterance length after
+speech starts, so delayed starts and natural pauses are less likely to be clipped. Set
+`ROCKY_VOICE_RECORD_MODE=fixed` to use the older fixed-duration recorder.
+
+If Rocky cuts you off mid-thought, increase `ROCKY_VOICE_RECORD_SECONDS` or
+`ROCKY_VOICE_SILENCE_SECONDS`. If Rocky misses quieter speech, lower
+`ROCKY_VOICE_SILENCE_THRESHOLD`; if background noise keeps recording open, raise it.
+`ROCKY_VOICE_PREROLL_SECONDS` controls how much audio before detected speech is kept.
+
+Use `ROCKY_VOICE_LISTEN_MODE=continuous` for hands-free conversation. In continuous mode,
+Rocky listens for speech, pauses while speaking the reply, then resumes listening. The default
+`push_to_talk` mode waits for Enter before each turn.
 
 ## External CLI Commands
 
