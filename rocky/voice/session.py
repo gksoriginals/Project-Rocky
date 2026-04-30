@@ -51,23 +51,92 @@ class VoiceSession:
             return ""
 
         print(f"You: {user_text}")
-        self.agent.process_turn(user_text)
-        reply = self.agent.session_state.last_answer.strip()
-        if not reply:
-            return ""
 
-        print(f"Rocky: {reply}")
-        output = tempfile.NamedTemporaryFile(prefix="rocky-reply-", suffix=".wav", delete=False)
-        output_path = Path(output.name)
-        output.close()
-        try:
-            assert self.tts is not None
-            self.tts.synthesize_to_file(reply, output_path)
-            self.player.play_file(output_path)
-        finally:
-            if not self.config.keep_audio:
-                output_path.unlink(missing_ok=True)
-        return reply
+        import queue
+        import threading
+        import re
+
+        sentence_queue = queue.Queue()
+        stop_event = threading.Event()
+
+        def tts_worker():
+            try:
+                while not stop_event.is_set():
+                    try:
+                        sentence = sentence_queue.get(timeout=0.1)
+                        if sentence is None:
+                            break
+                        if sentence.strip():
+                            # Print the sentence as it is being spoken
+                            print(f"Rocky: {sentence}", flush=True)
+                            output = tempfile.NamedTemporaryFile(prefix="rocky-reply-", suffix=".wav", delete=False)
+                            output_path = Path(output.name)
+                            output.close()
+                            try:
+                                assert self.tts is not None
+                                self.tts.synthesize_to_file(sentence, output_path)
+                                self.player.play_file(output_path)
+                            finally:
+                                if not self.config.keep_audio:
+                                    output_path.unlink(missing_ok=True)
+                    except queue.Empty:
+                        continue
+            except Exception as e:
+                print(f"\n[TTS Error] {e}")
+
+        tts_thread = threading.Thread(target=tts_worker, daemon=True)
+        tts_thread.start()
+
+        class StreamState:
+            spoken_cursor = 0
+            current_text = ""
+            is_tool_call = False
+
+        state = StreamState()
+
+        def on_event(event):
+            if event.type == "assistant_delta":
+                new_text = event.payload.get("content", "")
+                
+                # Detect new turn
+                if len(new_text) < len(state.current_text):
+                    if not state.is_tool_call and state.current_text[state.spoken_cursor:].strip():
+                        sentence_queue.put(state.current_text[state.spoken_cursor:].strip())
+                    state.spoken_cursor = 0
+                    state.is_tool_call = False
+                
+                state.current_text = new_text
+                
+                if "<tool" in state.current_text or "<thought" in state.current_text:
+                    state.is_tool_call = True
+                    return
+                
+                if state.is_tool_call:
+                    return
+                
+                unspoken = state.current_text[state.spoken_cursor:]
+                match = re.search(r'(?<=[.!?])\s+', unspoken)
+                while match:
+                    sentence_end = match.start()
+                    sentence = unspoken[:sentence_end].strip()
+                    if sentence:
+                        sentence_queue.put(sentence)
+                    state.spoken_cursor += sentence_end + len(match.group())
+                    unspoken = state.current_text[state.spoken_cursor:]
+                    match = re.search(r'(?<=[.!?])\s+', unspoken)
+
+        self.agent.process_turn(user_text, on_event=on_event)
+
+        # Flush any remaining text from the final turn
+        if not state.is_tool_call:
+            remaining = state.current_text[state.spoken_cursor:].strip()
+            if remaining:
+                sentence_queue.put(remaining)
+
+        sentence_queue.put(None)
+        tts_thread.join()
+
+        return self.agent.session_state.last_answer.strip()
 
     def run(self) -> int:
         print("Rocky voice mode")
