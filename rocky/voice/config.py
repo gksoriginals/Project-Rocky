@@ -49,11 +49,12 @@ class VoiceConfig:
     @classmethod
     def from_env(cls) -> "VoiceConfig":
         language = os.getenv("ROCKY_VOICE_STT_LANGUAGE") or None
+        default_tts = "say" if sys.platform == "darwin" else "piper"
         return cls(
             stt_backend=os.getenv("ROCKY_VOICE_STT", "faster-whisper").strip().lower(),
             stt_model=os.getenv("ROCKY_VOICE_STT_MODEL", "large-v3-turbo").strip(),
             stt_language=language.strip() if language else None,
-            tts_backend=os.getenv("ROCKY_VOICE_TTS", cls.tts_backend).strip().lower(),
+            tts_backend=os.getenv("ROCKY_VOICE_TTS", default_tts).strip().lower(),
             tts_voice=os.getenv("ROCKY_VOICE_NAME", "af_heart").strip(),
             tts_language=os.getenv("ROCKY_VOICE_TTS_LANGUAGE", "a").strip(),
             tts_speed=_float_env("ROCKY_VOICE_TTS_SPEED", 1.0),

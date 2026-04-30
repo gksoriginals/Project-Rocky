@@ -6,6 +6,7 @@ import textwrap
 from rocky.agent import RockyAgent
 from rocky.events import AgentEvent
 from rocky.session import SessionState
+from rocky.tui.voice import TUIVoiceManager
 
 HEADER_TITLE = "R O C K Y"
 
@@ -312,6 +313,7 @@ class RockyTUI:
     def __init__(self, agent: RockyAgent):
         self.agent = agent
         self.session_state = agent.get_session_state()
+        self.voice = TUIVoiceManager(self)
         self.buffer_text = ""
         self._screen = None
         self._should_exit = False
@@ -335,6 +337,7 @@ class RockyTUI:
         self.buffer_text = ""
         self._render()
         self.agent.process_turn(prompt, on_event=self.handle_event)
+        self.voice.process_turn_end()
         self.session_state = self.agent.get_session_state()
         self._render()
 
@@ -371,10 +374,12 @@ class RockyTUI:
             content = str(payload.get("content") or "")
             self.session_state.set_answer(content)
             self._upsert_assistant_preview(content)
+            self.voice.process_delta(content)
         elif event_type == "assistant_message":
             content = str(payload.get("content") or "")
             self.session_state.set_answer(content)
             self._upsert_assistant_preview(content)
+            self.voice.process_delta(content)
         elif event_type == "tool_event":
             stage = str(payload.get("stage") or "")
             tool_call = payload.get("tool_call") or {}
@@ -418,6 +423,7 @@ class RockyTUI:
         remainder = remainder.strip()
 
         if command in {"quit", "exit"}:
+            self.voice.stop()
             self.session_state.set_notice("Session ended.")
             self.session_state.clear_current_trace()
             self.session_state.add_trace_entry(
@@ -427,6 +433,17 @@ class RockyTUI:
                 turn_index=self.session_state.turn_index,
             )
             self._should_exit = True
+            return
+
+        if command == "voice":
+            self.session_state.clear_current_trace()
+            self.voice.toggle()
+            self.session_state.add_trace_entry(
+                phase="command",
+                summary="/voice",
+                detail="toggled continuous voice mode",
+                turn_index=self.session_state.turn_index,
+            )
             return
 
         if command == "clear":
@@ -475,7 +492,7 @@ class RockyTUI:
                     "/memory search <title> | "
                     "/memory list [semantic|episodic] [n] | "
                     "/memory delete [semantic|episodic] [selector] | "
-                    "/reset | /compact | /tools | /clear | /quit"
+                    "/reset | /compact | /tools | /clear | /voice | /quit"
                 ),
                 turn_index=self.session_state.turn_index,
             )
@@ -655,6 +672,9 @@ class RockyTUI:
             try:
                 ch = stdscr.get_wch()
             except curses.error:
+                if self.voice.active and not self.voice.input_queue.empty():
+                    prompt = self.voice.input_queue.get()
+                    self.submit_prompt(prompt)
                 self._frame += 1
                 continue
 

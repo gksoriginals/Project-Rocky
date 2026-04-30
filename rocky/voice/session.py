@@ -50,8 +50,6 @@ class VoiceSession:
         if not user_text:
             return ""
 
-        print(f"You: {user_text}")
-
         import queue
         import threading
         import re
@@ -96,7 +94,7 @@ class VoiceSession:
 
         def on_event(event):
             if event.type == "assistant_delta":
-                new_text = event.payload.get("content", "")
+                new_text = str(event.payload.get("content") or "")
                 
                 # Detect new turn
                 if len(new_text) < len(state.current_text):
@@ -125,7 +123,8 @@ class VoiceSession:
                     unspoken = state.current_text[state.spoken_cursor:]
                     match = re.search(r'(?<=[.!?])\s+', unspoken)
 
-        self.agent.process_turn(user_text, on_event=on_event)
+        for _ in self.agent.process_turn(user_text, on_event=on_event):
+            pass
 
         # Flush any remaining text from the final turn
         if not state.is_tool_call:

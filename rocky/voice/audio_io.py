@@ -107,3 +107,10 @@ class AudioPlayer:
         data, sample_rate = sf.read(str(audio_path), dtype="float32")
         sd.play(data, sample_rate)
         sd.wait()
+
+    def stop(self) -> None:
+        try:
+            import sounddevice as sd
+            sd.stop()
+        except ImportError:
+            pass

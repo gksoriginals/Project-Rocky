@@ -128,6 +128,7 @@ Inside the Rocky TUI, you can use the following slash commands:
 - `/tools`: List all tools currently available to Rocky.
 - `/clear`: Clear the visible conversation history from the TUI (does not delete memory).
 - `/reset`: Full session reset—wipes episodic memory and session snapshots while preserving semantic memory.
+- `/voice`: Toggle continuous voice mode on or off. Enables hands-free conversation with STT/TTS running alongside the TUI.
 - `/help`: Show available commands and their usage.
 - `/quit` or `/exit`: Exit the Rocky session.
 

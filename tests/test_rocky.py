@@ -183,9 +183,14 @@ class VoiceSessionTests(unittest.TestCase):
                 self.session_state = SimpleNamespace(last_answer="")
                 self.user_text = ""
 
-            def process_turn(self, user_text):
+            def process_turn(self, user_text, on_event=None):
                 self.user_text = user_text
                 self.session_state.last_answer = "hi human"
+                if on_event:
+                    from rocky.agent import AgentEvent
+                    event = AgentEvent(type="assistant_delta", payload={"content": "hi human"})
+                    on_event(event)
+                    yield event
 
         recorder = FakeRecorder()
         stt = FakeSTT()
@@ -203,7 +208,6 @@ class VoiceSessionTests(unittest.TestCase):
         )
 
         reply = session.run_once()
-
         self.assertEqual(reply, "hi human")
         self.assertEqual(agent.user_text, "hello rocky")
         self.assertEqual(tts.text, "hi human")
